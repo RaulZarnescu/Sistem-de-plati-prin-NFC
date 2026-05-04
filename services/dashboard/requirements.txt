@@ -1,0 +1,35 @@
+# requirements.txt — lista de librării Python necesare acestui serviciu
+#
+# De ce avem un requirements.txt per serviciu și nu unul global?
+# Pentru că fiecare container Docker e independent. Issuing Bank
+# ar putea avea nevoie de librării diferite față de Gateway.
+# Separarea înseamnă containere mai mici și mai sigure.
+
+# FastAPI — framework-ul web pe care îl folosim
+# "Framework" = un set de unelte care ne scutește să scriem
+# de la zero lucruri comune (rutare HTTP, validare date, etc.)
+fastapi==0.111.0
+
+# Uvicorn — serverul care rulează aplicația FastAPI
+# FastAPI definește logica, Uvicorn "ascultă" pe rețea și
+# trimite cererile HTTP către FastAPI
+uvicorn[standard]==0.29.0
+
+# Pydantic — validarea automată a datelor
+# Când Gateway-ul primește un JSON de la POS, Pydantic verifică
+# automat că are toate câmpurile necesare și tipurile corecte
+# (ex: amount e număr, nu text)
+pydantic==2.7.1
+
+# Python-dotenv — citirea fișierului .env
+# Permite os.getenv() să citească valorile din .env automat
+python-dotenv==1.0.1
+
+# Redis — clientul Python pentru serverul Redis
+# Folosit pentru idempotență și rate limiting
+redis==5.0.4
+
+# Httpx — client HTTP async pentru a apela alte microservicii
+# Gateway-ul trebuie să apeleze TSP, Bank, etc.
+# httpx e mai modern decât requests și suportă async/await
+httpx==0.27.0
