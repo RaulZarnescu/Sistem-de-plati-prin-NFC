@@ -1,0 +1,78 @@
+# ============================================================
+# .gitignore — îi spune lui Git ce fișiere să IGNORE
+# Adică: aceste fișiere NU vor fi urcate pe GitHub niciodată
+# ============================================================
+
+
+# --- SECRETE ------------------------------------------------
+# Fișierul cu variabilele de mediu (chei secrete, parole)
+# Acesta este CEL MAI IMPORTANT lucru de ignorat!
+.env
+
+# Dar păstrăm un exemplu fără valori reale, ca să știe
+# colegii ce variabile trebuie să definească ei local
+# (fișierul .env.example SE urcă pe GitHub — nu are secrete)
+
+
+# --- CERTIFICATE mTLS ---------------------------------------
+# Certificatele și cheile private generate local
+# Fiecare dezvoltator le generează pe calculatorul său
+certs/*.pem
+certs/*.key
+certs/*.crt
+certs/*.csr
+# Excepție: păstrăm folderul gol cu .gitkeep
+!certs/.gitkeep
+
+
+# --- PYTHON -------------------------------------------------
+# Fișiere generate automat de Python — nu au ce căuta în repo
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Mediile virtuale Python (pot fi uriașe, sute de MB)
+venv/
+env/
+.venv/
+
+# Fișiere de build/distribuție Python
+dist/
+build/
+*.egg-info/
+
+
+# --- BAZE DE DATE LOCALE ------------------------------------
+# Fișiere SQLite generate în dezvoltare
+*.db
+*.sqlite
+*.sqlite3
+
+
+# --- EDITOARE DE COD ----------------------------------------
+# Setările personale ale editorului tău NU îi interesează
+# pe colegii tăi
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+
+# --- SISTEME DE OPERARE -------------------------------------
+# Fișiere generate automat de macOS / Windows
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# --- DOCKER -------------------------------------------------
+# Volume-uri Docker montate local (dacă există)
+docker-volumes/
+
+
+# --- LOGURI -------------------------------------------------
+*.log
+logs/

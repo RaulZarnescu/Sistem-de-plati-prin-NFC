@@ -1,0 +1,259 @@
+# ============================================================
+# docker-compose.yml — Orchestratorul întregului sistem
+#
+# Docker Compose pornește și conectează toate containerele.
+# Gândește-te la el ca la un "director de scenă" care știe
+# în ce ordine să pornească actorii și cum să îi conecteze.
+#
+# Sintaxa: YAML (Yet Another Markup Language)
+# YAML e sensibil la indentare! Folosiți ÎNTOTDEAUNA spații,
+# niciodată TAB-uri.
+# ============================================================
+
+# Versiunea sintaxei docker-compose
+# "3.8" e stabilă și suportă toate funcțiile de care avem nevoie
+version: "3.8"
+
+
+# "services" = lista tuturor containerelor sistemului nostru
+# Fiecare intrare de sub "services:" e un container separat
+services:
+
+  # ============================================================
+  # SERVICIUL 1: Payment Gateway
+  # ============================================================
+  gateway:
+    # "build" îi spune lui Docker CUM să construiască imaginea
+    # "context" = folderul care se trimite lui Docker
+    # "dockerfile" = fișierul Dockerfile de folosit
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    
+    # Numele containerului (vizibil în "docker compose ps")
+    container_name: nfc-gateway
+    
+    # "ports" = deschide portul containerului către calculatorul tău
+    # Format: "PORT_HOST:PORT_CONTAINER"
+    # "8001:8001" = portul 8001 de pe calculatorul tău → portul 8001 din container
+    # Astfel poți accesa: http://localhost:8001
+    ports:
+      - "8001:8001"
+    
+    # "environment" = variabile de mediu injectate în container
+    # Citim valorile din fișierul .env (definit mai jos la "env_file")
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - GATEWAY_PORT=${GATEWAY_PORT}
+      - GATEWAY_RATE_LIMIT_PER_TERMINAL=${GATEWAY_RATE_LIMIT_PER_TERMINAL}
+      - GATEWAY_CIRCUIT_BREAKER_TPS=${GATEWAY_CIRCUIT_BREAKER_TPS}
+      - REDIS_HOST=redis-master      # Numele serviciului Redis din acest fișier
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    
+    # Citim variabilele din fișierul .env
+    env_file:
+      - .env
+    
+    # "depends_on" = pornește gateway DUPĂ ce redis-master e pornit
+    # ATENȚIE: "pornit" ≠ "gata să accepte conexiuni"
+    # Pentru verificare reală de sănătate, folosim "healthcheck" (mai jos)
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    
+    # "networks" = la ce rețele virtuale Docker e conectat acest container
+    # Containerele din aceeași rețea pot comunica între ele folosind
+    # numele serviciului ca hostname (ex: http://tsp:8002)
+    networks:
+      - payment-network
+    
+    # "restart" = ce face Docker dacă containerul se oprește
+    # "unless-stopped" = repornește automat, dacă nu ai oprit tu manual
+    restart: unless-stopped
+    
+    # "volumes" = partajare de fișiere între calculator și container
+    # "./services/gateway:/app" = folderul local e "montat" în /app din container
+    # Utilitar în DEVELOPMENT: modificările de cod sunt vizibile instant
+    # fără să rebuild-uiești imaginea Docker!
+    # În PRODUCȚIE s-ar elimina acest volum (codul e copiat în imagine la build)
+    volumes:
+      - ./services/gateway:/app
+      # Montăm și folderul shared (codul comun)
+      - ./shared:/app/shared
+
+
+  # ============================================================
+  # SERVICIUL 2: Token Service Provider (TSP)
+  # (Schelet minimal — va fi completat în pașii următori)
+  # ============================================================
+  tsp:
+    build:
+      context: ./services/tsp
+      dockerfile: Dockerfile
+    container_name: nfc-tsp
+    ports:
+      - "8002:8002"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - TSP_PORT=${TSP_PORT}
+    env_file:
+      - .env
+    networks:
+      - payment-network
+    restart: unless-stopped
+    volumes:
+      - ./services/tsp:/app
+      - ./shared:/app/shared
+
+
+  # ============================================================
+  # SERVICIUL 3: Card Network Router
+  # ============================================================
+  card-network:
+    build:
+      context: ./services/card_network
+      dockerfile: Dockerfile
+    container_name: nfc-card-network
+    ports:
+      - "8003:8003"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - CARD_NETWORK_PORT=${CARD_NETWORK_PORT}
+    env_file:
+      - .env
+    networks:
+      - payment-network
+    restart: unless-stopped
+    volumes:
+      - ./services/card_network:/app
+      - ./shared:/app/shared
+
+
+  # ============================================================
+  # SERVICIUL 4: Issuing Bank
+  # ============================================================
+  issuing-bank:
+    build:
+      context: ./services/issuing_bank
+      dockerfile: Dockerfile
+    container_name: nfc-issuing-bank
+    ports:
+      - "8004:8004"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - ISSUING_BANK_PORT=${ISSUING_BANK_PORT}
+      - ISSUING_BANK_HMAC_MASTER_KEY=${ISSUING_BANK_HMAC_MASTER_KEY}
+      - FRAUD_SCORE_ALLOW_THRESHOLD=${FRAUD_SCORE_ALLOW_THRESHOLD}
+      - FRAUD_SCORE_STEP_UP_THRESHOLD=${FRAUD_SCORE_STEP_UP_THRESHOLD}
+      - FRAUD_DECAY_LAMBDA=${FRAUD_DECAY_LAMBDA}
+    env_file:
+      - .env
+    networks:
+      - payment-network
+    restart: unless-stopped
+    volumes:
+      - ./services/issuing_bank:/app
+      - ./shared:/app/shared
+
+
+  # ============================================================
+  # SERVICIUL 5: Dashboard
+  # ============================================================
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+    container_name: nfc-dashboard
+    ports:
+      - "8005:8005"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - DASHBOARD_PORT=${DASHBOARD_PORT}
+    env_file:
+      - .env
+    networks:
+      - payment-network
+    restart: unless-stopped
+    volumes:
+      - ./services/dashboard:/app
+      - ./shared:/app/shared
+
+
+  # ============================================================
+  # REDIS MASTER — Nodul principal Redis
+  #
+  # Redis e o bază de date "in-memory" (stochează totul în RAM).
+  # E ultra-rapidă tocmai pentru că nu scrie pe disk la fiecare operație.
+  # Folosim imaginea oficială Redis fără să scriem un Dockerfile.
+  # ============================================================
+  redis-master:
+    # "image" = folosim o imagine gata construită de pe Docker Hub
+    # Nu avem Dockerfile propriu pentru Redis
+    image: redis:7.2-alpine
+    # "alpine" = o distribuție Linux minimalistă (imagini mici, sigure)
+    
+    container_name: nfc-redis-master
+    
+    # Comanda de pornire Redis cu:
+    # --requirepass = parola de autentificare (din .env)
+    # --appendonly yes = activează AOF (Append Only File) pentru persistență
+    # --appendfsync everysec = scrie pe disk maxim o dată pe secundă
+    # Din spec (Cap. 4.6): AOF cu appendfsync everysec previne pierderea
+    # cheilor de idempotență la crash
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --appendonly yes
+      --appendfsync everysec
+    
+    ports:
+      - "6379:6379"
+    
+    # "healthcheck" = Docker verifică periodic dacă Redis e gata
+    # Dacă healthcheck-ul pică, containerele "depends_on" așteaptă
+    healthcheck:
+      # "redis-cli ping" returnează "PONG" dacă Redis e funcțional
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s      # Verifică la fiecare 5 secunde
+      timeout: 3s       # Timeout după 3 secunde
+      retries: 5        # După 5 eșecuri consecutive → "unhealthy"
+    
+    networks:
+      - payment-network
+    
+    restart: unless-stopped
+    
+    # Persistăm datele Redis pe disk
+    # Dacă containerul se oprește, datele nu se pierd
+    volumes:
+      - redis-data:/data
+
+
+# ============================================================
+# NETWORKS — Rețelele virtuale Docker
+#
+# De ce creăm o rețea separată?
+# Implicit, toate containerele din același docker-compose ar putea
+# comunica. Cu rețele explicite, avem control fin și izolare.
+# În viitor am putea crea rețele separate (ex: gateway nu poate
+# vorbi direct cu baza de date a băncii).
+# ============================================================
+networks:
+  payment-network:
+    # "bridge" = tipul implicit, potrivit pentru un singur server
+    driver: bridge
+    # Numele rețelei vizibil în "docker network ls"
+    name: nfc-payment-network
+
+
+# ============================================================
+# VOLUMES — Stocare persistentă
+#
+# Volumele Docker supraviețuiesc opririi containerelor.
+# redis-data stochează fișierele AOF ale Redis pe disk-ul
+# calculatorului tău (în /var/lib/docker/volumes/).
+# ============================================================
+volumes:
+  redis-data:
+    name: nfc-redis-data
