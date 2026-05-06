@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Sistem-Plata-NFC"
+rootProject.name = "sistem-plata-nfc"
 include(":app")
