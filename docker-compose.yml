@@ -10,11 +10,6 @@
 # niciodată TAB-uri.
 # ============================================================
 
-# Versiunea sintaxei docker-compose
-# "3.8" e stabilă și suportă toate funcțiile de care avem nevoie
-version: "3.8"
-
-
 # "services" = lista tuturor containerelor sistemului nostru
 # Fiecare intrare de sub "services:" e un container separat
 services:

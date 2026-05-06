@@ -20,7 +20,8 @@
 # FastAPI() = creează aplicația web
 # HTTPException = eroare HTTP standard (ex: 400, 401, 429)
 # Request = reprezintă o cerere HTTP primită
-from fastapi import FastAPI, HTTPException, Request
+import collections
+from fastapi import FastAPI, HTTPException, Request, Header
 
 # Pydantic — pentru definirea structurii datelor așteptate
 # BaseModel = clasa de bază pentru orice "model" de date
@@ -39,6 +40,8 @@ import logging
 
 # json — pentru a formata log-urile ca JSON (Structured Logging din spec)
 import json
+import re
+import httpx
 
 # datetime — pentru timestamp-uri în log-uri
 from datetime import datetime, timezone
@@ -55,30 +58,30 @@ load_dotenv()  # Apelat imediat la import, înainte de orice altceva
 # De ce JSON? Pentru că un SIEM (Wazuh, etc.) poate parsa automat
 # JSON și căuta după câmpuri specifice (ex: toți event_type="FRAUD_SCORED")
 
-class JSONFormatter(logging.Formatter):
+class MaskedJSONFormatter(logging.Formatter):
     """
-    Formatter personalizat care convertește log-urile în JSON.
-    
-    'Formatter' = clasa care decide CUM arată un mesaj de log.
-    Extindem (moștenim) clasa de bază și suprascriem metoda format().
+    Formatter personalizat care convertește log-urile în JSON
+    și maschează automat numerele de card (PAN/DPAN) conform PCI-DSS.
     """
     
     def format(self, record: logging.LogRecord) -> str:
-        """
-        Primește un LogRecord (obiectul intern Python pentru un log)
-        și returnează un string JSON.
-        """
+        def mask_pan(match):
+            pan = match.group(0)
+            if len(pan) >= 13 and len(pan) <= 19:
+                return f"{pan[:4]}********{pan[-4:]}"
+            return pan
+
+        message = record.getMessage()
+        masked_message = re.sub(r'\b\d{13,19}\b', mask_pan, message)
+
         log_entry = {
-            # Din spec: câmpuri obligatorii în fiecare log
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,           # INFO, WARNING, ERROR, etc.
-            "service": "payment-gateway",         # Identifică microserviciul
-            "event_type": getattr(record, "event_type", "GENERAL"),  # Custom field
-            "message": record.getMessage(),
+            "level": record.levelname,
+            "service": "payment-gateway",
+            "event_type": getattr(record, "event_type", "GENERAL"),
+            "message": masked_message,
         }
         
-        # Dacă există câmpuri extra (adăugate cu logger.info(..., extra={...}))
-        # le includem în log
         if hasattr(record, "terminal_id"):
             log_entry["terminal_id"] = record.terminal_id
         if hasattr(record, "trace_id"):
@@ -94,8 +97,10 @@ logger.setLevel(logging.INFO)
 # Adăugăm un handler care scrie în consolă (stdout)
 # Docker captează automat stdout și îl face accesibil cu "docker logs"
 handler = logging.StreamHandler()
-handler.setFormatter(JSONFormatter())
-logger.addHandler(handler)
+handler.setFormatter(MaskedJSONFormatter())
+
+if not logger.handlers:
+    logger.addHandler(handler)
 
 
 # --- CREAREA APLICAȚIEI FASTAPI -----------------------------
@@ -193,6 +198,12 @@ async def startup_event():
     În Python async, mai multe operații pot rula "în paralel"
     fără să se blocheze reciproc (important pentru un server web).
     """
+    # Suprascriem logger-ele implicite din uvicorn pentru a folosi formatul JSON
+    for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        u_logger = logging.getLogger(logger_name)
+        u_logger.handlers = [handler]
+        u_logger.propagate = False
+
     logger.info(
         "Payment Gateway pornit",
         extra={"event_type": "SERVICE_STARTUP"}
@@ -236,8 +247,10 @@ async def health_check():
 
 @app.post("/api/v1/payments/authorize", response_model=PaymentResponse)
 async def authorize_payment(
-    request: Request,           # Obiectul HTTP request complet (pentru headers)
-    payment: PaymentRequest     # Body-ul JSON, validat automat de Pydantic
+    request: Request,           # Obiectul HTTP request complet
+    payment: PaymentRequest,    # Body-ul JSON, validat automat de Pydantic
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key", description="Header obligatoriu (ex: test-trace-123)"),
+    x_terminal_id: Optional[str] = Header(None, alias="X-Terminal-Id", description="Header obligatoriu (ex: POS-001)")
 ):
     """
     Endpoint principal de autorizare plată.
@@ -317,40 +330,87 @@ async def authorize_payment(
     # TODO: Verificare idempotență cu Redis SETNX
     
     
-    # --- PASUL 4: Rutare (TODO) ------------------------------
-    # Va fi implementat când avem TSP și Issuing Bank
-    # TODO: Apel TSP → Card Network → Issuing Bank
-    
-    
-    # --- RĂSPUNS TEMPORAR ------------------------------------
-    # Deocamdată returnăm un răspuns hardcodat ca să putem testa
-    # că endpoint-ul funcționează. Va fi înlocuit cu logica reală.
+    # --- PASUL 4: Rutare către TSP ------------------------------
     logger.info(
-        "Tranzacție procesată (mock)",
-        extra={
-            "event_type": "TX_MOCK_RESPONSE",
-            "terminal_id": terminal_id,
-            "trace_id": idempotency_key,
-        }
+        "Trimitere request către TSP pentru detokenizare...",
+        extra={"event_type": "TSP_REQUEST_INITIATED", "trace_id": idempotency_key, "terminal_id": terminal_id}
     )
     
+    tsp_url = "http://tsp:8002/api/v1/tokens/detokenize"
+    tsp_payload = {
+        "dpan": payment.dpan,
+        "trace_id": idempotency_key
+    }
+    
+    # Timeout setat la 300ms pentru a menține pragul Fail-Fast de 2 secunde alocat Gateway-ului
+    try:
+        async with httpx.AsyncClient(timeout=0.3) as client:
+            tsp_response = await client.post(tsp_url, json=tsp_payload)
+            
+        if tsp_response.status_code == 404:
+            logger.warning(
+                "TSP a returnat 404: Token negăsit",
+                extra={"event_type": "TSP_TOKEN_NOT_FOUND", "trace_id": idempotency_key, "terminal_id": terminal_id}
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": "INVALID_TOKEN",
+                    "message": "Token-ul (DPAN) este invalid sau inexistent",
+                    "retry_after_ms": 0,
+                    "action_required": "USE_DIFFERENT_CARD"
+                }
+            )
+            
+        tsp_response.raise_for_status()
+        
+        tsp_data = tsp_response.json()
+        pan = tsp_data.get("pan")
+        
+        logger.info(
+            f"TSP a returnat PAN-ul cu succes: {pan}",
+            extra={"event_type": "TSP_REQUEST_SUCCESS", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        
+    except httpx.TimeoutException:
+        logger.error(
+            "Timeout (300ms) la comunicarea cu TSP",
+            extra={"event_type": "TSP_TIMEOUT", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "TSP_SERVICE_UNAVAILABLE",
+                "message": "TSP nu a răspuns în timp util",
+                "retry_after_ms": 1000,
+                "action_required": "RETRY_LATER"
+            }
+        )
+    except httpx.RequestError as exc:
+        logger.error(
+            f"Eroare rețea la comunicarea cu TSP: {exc}",
+            extra={"event_type": "TSP_NETWORK_ERROR", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        raise HTTPException(status_code=503, detail="TSP connection failed")
+
+    # TODO: Mai departe vom adăuga rutarea către Card Network și Issuing Bank.
+    
+    # Deocamdată returnăm un răspuns mock cu confirmarea că s-a trecut de TSP.
     return PaymentResponse(
-        status="APPROVED",
+        status="APPROVED_TSP_MOCK",
         transaction_id=f"TXN-MOCK-{idempotency_key[:8]}",
         auth_code="MOCK01",
         risk_score=0,
         processed_at=datetime.now(timezone.utc).isoformat()
     )
 
-
-# --- PORNIRE DIRECTĂ (pentru development fără Docker) -------
-# Acest bloc rulează DOAR dacă executăm direct: python main.py
-# Când Docker folosește CMD ["uvicorn", ...], acest bloc e ignorat
+# --- PORNIRE ---
 if __name__ == "__main__":
     import uvicorn
+    import os
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("GATEWAY_PORT", 8001)),
-        reload=True  # Auto-reload la modificări de cod (doar în development)
+        reload=True
     )
