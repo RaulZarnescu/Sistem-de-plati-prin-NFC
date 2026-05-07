@@ -10,6 +10,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import Optional
+from contextlib import asynccontextmanager
 import os
 import logging
 import json
@@ -46,6 +47,18 @@ class MaskedJSONFormatter(logging.Formatter):
             "message": masked_message,
         }
         
+        # Extracție avansată pentru logurile de access HTTP ale Uvicorn
+        if record.name == "uvicorn.access":
+            log_entry["event_type"] = "HTTP_ACCESS"
+            if record.args and len(record.args) >= 5:
+                try:
+                    log_entry["http_method"] = record.args[1]
+                    log_entry["http_path"] = record.args[2]
+                    log_entry["http_status"] = record.args[4]
+                    log_entry["client_addr"] = record.args[0]
+                except Exception:
+                    pass
+        
         if hasattr(record, "trace_id"):
             log_entry["trace_id"] = record.trace_id
             
@@ -60,12 +73,24 @@ handler.setFormatter(MaskedJSONFormatter())
 if not logger.handlers:
     logger.addHandler(handler)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Suprascriem logger-ele implicite din uvicorn pentru a folosi formatul JSON
+    for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        u_logger = logging.getLogger(logger_name)
+        u_logger.handlers = [handler]
+        u_logger.propagate = False
+
+    logger.info("TSP Service pornit", extra={"event_type": "SERVICE_STARTUP"})
+    yield
+
 # --- APLICAȚIA FASTAPI ---
 
 app = FastAPI(
     title="NFC Token Service Provider",
     description="Microserviciu care mapează DPAN la PAN real",
     version="1.0.0",
+    lifespan=lifespan
 )
 
 # --- MOCK DATA (Token Vault temporar) ---
@@ -73,30 +98,28 @@ app = FastAPI(
 # AC-07: PAN-urile de mai jos NU trebuie să apară NICIODATĂ în loguri complet.
 
 TOKEN_VAULT = {
+    # Banca A (prefix 4000 — Visa Fictive Bank A)
     "4000000000000001": {
-        "pan": "4111111111111111",
-        "exp_month": "12",
-        "exp_year": "28",
-        "risk_level": "0"
-    },
-    "5000000000000002": {
-        "pan": "5555555555555555",
-        "exp_month": "10",
-        "exp_year": "27",
-        "risk_level": "1"
-    },
-    "0000000000000001": {
-        "pan": "0000000000000001",
-        "exp_month": "01",
-        "exp_year": "30",
+        "pan": "4000001111111111",
+        "exp_month": "12", "exp_year": "28",
         "risk_level": "0"
     },
     "TEST-STEP-UP-001": {
-    "pan": "4222222222222222",
-    "exp_month": "12",
-    "exp_year": "28",
-    "risk_level": "55"
-}
+        "pan": "4222222222222222",
+        "exp_month": "12", "exp_year": "28",
+        "risk_level": "55"
+    },
+    # Banca B (prefix 5000 — Mastercard Fictive Bank B)
+    "5000000000000002": {
+        "pan": "5000002222222222",
+        "exp_month": "10", "exp_year": "27",
+        "risk_level": "0"
+    },
+    "5000000000000003": {
+        "pan": "5000003333333333",
+        "exp_month": "06", "exp_year": "29",
+        "risk_level": "0"
+    },
 }
 
 # --- MODELE PYDANTIC ---
@@ -113,15 +136,7 @@ class TokenLookupResponse(BaseModel):
 
 # --- ENDPOINT-URI ---
 
-@app.on_event("startup")
-async def startup_event():
-    # Suprascriem logger-ele implicite din uvicorn pentru a folosi formatul JSON
-    for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-        u_logger = logging.getLogger(logger_name)
-        u_logger.handlers = [handler]
-        u_logger.propagate = False
 
-    logger.info("TSP Service pornit", extra={"event_type": "SERVICE_STARTUP"})
 
 @app.get("/health")
 async def health_check():

@@ -49,7 +49,7 @@ class MaskedJSONFormatter(logging.Formatter):
         log_entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
-            "service": "issuing-bank",
+            "service": "issuing-bank-b",
             "event_type": getattr(record, "event_type", "GENERAL"),
             "message": masked_message,
         }
@@ -72,7 +72,7 @@ class MaskedJSONFormatter(logging.Formatter):
         return json.dumps(log_entry, ensure_ascii=False)
 
 
-logger = logging.getLogger("issuing_bank")
+logger = logging.getLogger("issuing_bank_b")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(MaskedJSONFormatter())
@@ -128,7 +128,7 @@ async def lifespan(app: FastAPI):
         u_logger.handlers = [handler]
         u_logger.propagate = False
 
-    logger.info("Issuing Bank pornit", extra={"event_type": "SERVICE_STARTUP"})
+    logger.info("Issuing Bank B pornit", extra={"event_type": "SERVICE_STARTUP"})
     
     if not HMAC_KEY:
         logger.error("ISSUING_BANK_HMAC_MASTER_KEY lipsește din mediu!", extra={"event_type": "CONFIG_ERROR"})
@@ -142,7 +142,7 @@ app = FastAPI(title="NFC Issuing Bank", version="1.0.0", lifespan=lifespan)
 async def health_check():
     return {
         "status": "healthy",
-        "service": "issuing-bank",
+        "service": "issuing-bank-b",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 

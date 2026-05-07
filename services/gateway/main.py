@@ -20,8 +20,14 @@
 # FastAPI() = creează aplicația web
 # HTTPException = eroare HTTP standard (ex: 400, 401, 429)
 # Request = reprezintă o cerere HTTP primită
-import collections
+
 from fastapi import FastAPI, HTTPException, Request, Header
+from contextlib import asynccontextmanager
+import uuid
+import time
+import redis.asyncio as aioredis
+
+redis_client: aioredis.Redis = None
 
 # Pydantic — pentru definirea structurii datelor așteptate
 # BaseModel = clasa de bază pentru orice "model" de date
@@ -41,15 +47,16 @@ import logging
 # json — pentru a formata log-urile ca JSON (Structured Logging din spec)
 import json
 import re
+# pyright: ignore [reportMissingImports]
 import httpx
 
 # datetime — pentru timestamp-uri în log-uri
 from datetime import datetime, timezone
 
 # dotenv — citește automat fișierul .env și populează os.environ
+# pyright: ignore [reportMissingImports]
 from dotenv import load_dotenv
 load_dotenv()  # Apelat imediat la import, înainte de orice altceva
-
 
 # --- CONFIGURAREA LOG-URILOR --------------------------------
 # Din specificație (Cap. 7.1): "toate componentele vor genera log-uri
@@ -82,6 +89,18 @@ class MaskedJSONFormatter(logging.Formatter):
             "message": masked_message,
         }
         
+        # Extracție avansată pentru logurile de access HTTP ale Uvicorn
+        if record.name == "uvicorn.access":
+            log_entry["event_type"] = "HTTP_ACCESS"
+            if record.args and len(record.args) >= 5:
+                try:
+                    log_entry["http_method"] = record.args[1]
+                    log_entry["http_path"] = record.args[2]
+                    log_entry["http_status"] = record.args[4]
+                    log_entry["client_addr"] = record.args[0]
+                except Exception:
+                    pass
+        
         if hasattr(record, "terminal_id"):
             log_entry["terminal_id"] = record.terminal_id
         if hasattr(record, "trace_id"):
@@ -103,13 +122,48 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
+# --- EVENT HANDLERS -----------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global redis_client
+    
+    # Suprascriem logger-ele implicite din uvicorn pentru a folosi formatul JSON
+    for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        u_logger = logging.getLogger(logger_name)
+        u_logger.handlers = [handler]
+        u_logger.propagate = False
+
+    try:
+        redis_client = aioredis.Redis(
+            host=os.getenv("REDIS_HOST", "redis-master"),
+            port=int(os.getenv("REDIS_PORT", 6379)),
+            password=os.getenv("REDIS_PASSWORD"),
+            decode_responses=True
+        )
+        await redis_client.ping()
+        logger.info("Conexiune Redis stabilită", extra={"event_type": "REDIS_CONNECTED"})
+    except Exception as e:
+        logger.error(f"Redis indisponibil la startup: {e}", extra={"event_type": "REDIS_ERROR"})
+
+    logger.info(
+        "Payment Gateway pornit",
+        extra={"event_type": "SERVICE_STARTUP"}
+    )
+    logger.info(
+        f"Mediu: {os.getenv('ENVIRONMENT', 'development')}",
+        extra={"event_type": "SERVICE_STARTUP"}
+    )
+    yield
+    
+    if redis_client:
+        await redis_client.aclose()
+
 # --- CREAREA APLICAȚIEI FASTAPI -----------------------------
-# FastAPI() creează instanța principală a aplicației.
-# Parametrii sunt opționali dar utili pentru documentația automată.
 app = FastAPI(
     title="NFC Payment Gateway",
     description="Microserviciu care primește cereri de la terminalele POS",
     version="1.0.0",
+    lifespan=lifespan
 )
 
 
@@ -185,34 +239,6 @@ class PaymentResponse(BaseModel):
     processed_at: Optional[str] = Field(None, description="Timestamp procesare")
 
 
-# --- EVENT HANDLERS -----------------------------------------
-# FastAPI permite să rulăm cod la pornire/oprire aplicație
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    Rulează O DATĂ când containerul pornește.
-    Ideal pentru: inițializarea conexiunilor, verificări de sănătate.
-    
-    "async" = această funcție e asincronă (non-blocking).
-    În Python async, mai multe operații pot rula "în paralel"
-    fără să se blocheze reciproc (important pentru un server web).
-    """
-    # Suprascriem logger-ele implicite din uvicorn pentru a folosi formatul JSON
-    for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-        u_logger = logging.getLogger(logger_name)
-        u_logger.handlers = [handler]
-        u_logger.propagate = False
-
-    logger.info(
-        "Payment Gateway pornit",
-        extra={"event_type": "SERVICE_STARTUP"}
-    )
-    logger.info(
-        f"Mediu: {os.getenv('ENVIRONMENT', 'development')}",
-        extra={"event_type": "SERVICE_STARTUP"}
-    )
-
 
 # --- ENDPOINT-URI -------------------------------------------
 # Un "endpoint" = o adresă URL la care serviciul nostru răspunde
@@ -273,8 +299,8 @@ async def authorize_payment(
     # Din spec (Cap. 2.2): headers obligatorii sunt
     # X-Idempotency-Key și X-Terminal-Id
     
-    idempotency_key = request.headers.get("X-Idempotency-Key")
-    terminal_id = request.headers.get("X-Terminal-Id")
+    idempotency_key = x_idempotency_key
+    terminal_id = x_terminal_id
     
     # Verificăm că header-ele există
     if not idempotency_key:
@@ -319,15 +345,74 @@ async def authorize_payment(
         }
     )
     
-    # --- PASUL 2: Rate Limiting (TODO) -----------------------
-    # Va fi implementat în pasul următor cu Redis
-    # Deocamdată lăsăm un comentariu placeholder
-    # TODO: Verificare rate limiting cu Redis
+    # --- FAIL-CLOSED: Validare Redis ---
+    if not redis_client:
+        logger.error("Redis indisponibil. Respingere cerere (Fail-Closed).", extra={"event_type": "FAIL_CLOSED"})
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "IDEMPOTENCY_STORE_DOWN",
+                "message": "Serviciu temporar indisponibil",
+                "retry_after_ms": 5000,
+                "action_required": "NONE"
+            }
+        )
+
+    # --- PASUL 2: Rate Limiting (Token Bucket per terminal. Max 2 req/sec)
+    rate_key = f"rate:{terminal_id}:{int(time.time())}"
+    count = await redis_client.incr(rate_key)
+    if count == 1:
+        await redis_client.expire(rate_key, 1)
+        
+    if count > 2:
+        logger.warning(
+            f"Rate limit depășit pentru terminalul {terminal_id}",
+            extra={"event_type": "RATE_LIMIT_EXCEEDED", "terminal_id": terminal_id, "trace_id": idempotency_key}
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error_code": "RATE_LIMIT_EXCEEDED",
+                "message": "Prea multe cereri. Maxim 2 cereri pe secundă.",
+                "retry_after_ms": 1000,
+                "action_required": "RETRY_LATER"
+            }
+        )
     
+    # --- PASUL 3: Idempotență (Redis SET atomic) -------------------------
+    idemp_key = f"idemp:{idempotency_key}"
     
-    # --- PASUL 3: Idempotență (TODO) -------------------------
-    # Va fi implementat cu Redis SETNX
-    # TODO: Verificare idempotență cu Redis SETNX
+    # Încercăm să scriem cheia cu flag-ul NX (Not eXists) și EX atomic.
+    is_new = await redis_client.set(
+        idemp_key, 
+        "PROCESSING",
+        nx=True,      # Only set if Not eXists
+        ex=30         # Expire în 30 secunde, setat atomic
+    )
+    if not is_new:
+            # Cheia există deja. Verificăm valoarea.
+            cached_val = await redis_client.get(idemp_key)
+            if cached_val == "PROCESSING":
+                logger.warning(
+                    "Cerere concurentă cu aceeași cheie de idempotență",
+                    extra={"event_type": "CONCURRENT_REQUEST_BLOCKED", "terminal_id": terminal_id, "trace_id": idempotency_key}
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_code": "CONCURRENT_REQUEST",
+                        "message": "O cerere cu acest idempotency key este deja în procesare",
+                        "retry_after_ms": 2000,
+                        "action_required": "RETRY_LATER"
+                    }
+                )
+            
+            # Altfel înseamnă că tranzacția s-a terminat anterior și avem răspunsul JSON cached.
+            logger.info(
+                "Returnare răspuns din cache (idempotență)",
+                extra={"event_type": "IDEMPOTENT_RESPONSE_RETURNED", "terminal_id": terminal_id, "trace_id": idempotency_key}
+            )
+            return PaymentResponse(**json.loads(cached_val))
     
     
     # --- PASUL 4: Rutare către TSP ------------------------------
@@ -368,7 +453,7 @@ async def authorize_payment(
         pan = tsp_data.get("pan")
         
         logger.info(
-            f"TSP a returnat PAN-ul cu succes: {pan}",
+            "TSP a returnat detaliile cu succes.",
             extra={"event_type": "TSP_REQUEST_SUCCESS", "trace_id": idempotency_key, "terminal_id": terminal_id}
         )
         
@@ -386,6 +471,20 @@ async def authorize_payment(
                 "action_required": "RETRY_LATER"
             }
         )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            f"Eroare HTTP de la TSP: {exc.response.status_code}",
+            extra={"event_type": "TSP_HTTP_ERROR", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "TSP_SERVICE_ERROR",
+                "message": "TSP a returnat o eroare internă",
+                "retry_after_ms": 1000,
+                "action_required": "RETRY_LATER"
+            }
+        )
     except httpx.RequestError as exc:
         logger.error(
             f"Eroare rețea la comunicarea cu TSP: {exc}",
@@ -393,16 +492,104 @@ async def authorize_payment(
         )
         raise HTTPException(status_code=503, detail="TSP connection failed")
 
-    # TODO: Mai departe vom adăuga rutarea către Card Network și Issuing Bank.
-    
-    # Deocamdată returnăm un răspuns mock cu confirmarea că s-a trecut de TSP.
-    return PaymentResponse(
-        status="APPROVED_TSP_MOCK",
-        transaction_id=f"TXN-MOCK-{idempotency_key[:8]}",
-        auth_code="MOCK01",
-        risk_score=0,
-        processed_at=datetime.now(timezone.utc).isoformat()
+    # --- PASUL 5: Rutare către Card Network ------------------------------
+    logger.info(
+        "Trimitere request către Card Network...",
+        extra={"event_type": "CARD_NETWORK_ROUTING", "trace_id": idempotency_key, "terminal_id": terminal_id}
     )
+    
+    card_network_url = "http://card-network:8003/api/v1/transactions/route"
+    card_network_payload = {
+        "pan": pan,
+        "risk_level": tsp_data.get("risk_level", "0"),
+        "transaction": payment.transaction.model_dump(),
+        "cryptogram": payment.cryptogram.model_dump(),
+        "idempotency_key": idempotency_key,
+        "terminal_id": terminal_id
+    }
+    
+    # Timeout setat la 1.2s pentru a menține SLA-urile P99 (1500ms total)
+    try:
+        async with httpx.AsyncClient(timeout=1.2) as client:
+            card_network_response = await client.post(
+                card_network_url,
+                json=card_network_payload
+            )
+            
+        if card_network_response.status_code == 401:
+            error_data = card_network_response.json().get("detail", {})
+            logger.warning(
+                "Card Network cere Step-Up Authentication.",
+                extra={"event_type": "STEP_UP_REQUIRED", "trace_id": idempotency_key, "terminal_id": terminal_id}
+            )
+            # TODO: PoC — idemp_key rămâne "PROCESSING" cu TTL 30s.
+            # Producție: salvează starea CHALLENGE_REQUIRED în Redis ca stare finală.
+            raise HTTPException(status_code=401, detail=error_data)
+
+        if card_network_response.status_code == 400:
+            error_data = card_network_response.json().get("detail", {})
+            logger.warning(
+                f"Card Network a respins tranzacția: {error_data.get('message', 'N/A')}",
+                extra={"event_type": "CARD_NETWORK_REJECTED", "trace_id": idempotency_key, "terminal_id": terminal_id}
+            )
+            raise HTTPException(status_code=400, detail=error_data)
+            
+        card_network_response.raise_for_status()
+        
+        bank_data = card_network_response.json()
+        
+        logger.info(
+            "Card Network a aprobat tranzacția cu succes.",
+            extra={"event_type": "CARD_NETWORK_TRANSACTION_APPROVED", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        
+    except httpx.TimeoutException:
+        logger.error(
+            "Timeout (1200ms) la comunicarea cu Card Network",
+            extra={"event_type": "CARD_NETWORK_TIMEOUT", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "CARD_NETWORK_SERVICE_UNAVAILABLE",
+                "message": "Card Network nu a răspuns în timp util",
+                "retry_after_ms": 1000,
+                "action_required": "RETRY_LATER"
+            }
+        )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            f"Eroare HTTP de la Card Network: {exc.response.status_code}",
+            extra={"event_type": "CARD_NETWORK_HTTP_ERROR", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "CARD_NETWORK_SERVICE_ERROR",
+                "message": "Card Network a returnat o eroare internă",
+                "retry_after_ms": 1000,
+                "action_required": "RETRY_LATER"
+            }
+        )
+    except httpx.RequestError as exc:
+        logger.error(
+            f"Eroare rețea la comunicarea cu Card Network: {exc}",
+            extra={"event_type": "CARD_NETWORK_NETWORK_ERROR", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+        raise HTTPException(status_code=503, detail="Card Network connection failed")
+
+    final_response = PaymentResponse(
+        status=bank_data.get("status", "DECLINED"),
+        transaction_id=bank_data.get("transaction_id", f"TXN-{uuid.uuid4().hex[:12].upper()}"),
+        auth_code=bank_data.get("auth_code"),
+        risk_score=bank_data.get("risk_score", 0),
+        processed_at=bank_data.get("processed_at", datetime.now(timezone.utc).isoformat())
+    )
+    
+    # Salvăm rezultatul final în Redis pentru 24h
+    await redis_client.setex(idemp_key, 86400, final_response.model_dump_json())
+        
+    return final_response
 
 # --- PORNIRE ---
 if __name__ == "__main__":

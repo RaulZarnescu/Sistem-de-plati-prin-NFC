@@ -151,6 +151,19 @@ services:
       - ./services/issuing_bank:/app
       - ./shared:/app/shared
 
+  issuing-bank-b:
+    build: ./services/issuing_bank_b
+    container_name: nfc-issuing-bank-b
+    ports:
+      - "${ISSUING_BANK_B_PORT:-8006}:8006"
+    environment:
+      - ISSUING_BANK_HMAC_MASTER_KEY=${ISSUING_BANK_B_HMAC_MASTER_KEY}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    networks:
+      - payment-network
+    volumes:
+      - ./services/issuing_bank_b:/app
+      - ./shared:/app/shared
 
   # ============================================================
   # SERVICIUL 5: Dashboard
