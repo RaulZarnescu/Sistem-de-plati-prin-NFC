@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.sistemplatanfc"
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Acces la cipul NFC fizic al telefonului -->
@@ -13,10 +14,8 @@
 
     <application
         android:allowBackup="true"
-        android:dataExtractionRules="@xml/data_extraction_rules"
-        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
-        android:label="sistem-plata-nfc"
+        android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Sistemplatanfc"
@@ -26,7 +25,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="sistem-plata-nfc"
+            android:label="@string/app_name"
             android:theme="@style/Theme.Sistemplatanfc">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

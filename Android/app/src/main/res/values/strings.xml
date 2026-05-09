@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">sistem-plata-nfc</string>
+    <string name="hce_service_description">Sistem de Plată NFC - Card Virtual</string>
+    <string name="hce_aid_group_description">Plăți NFC</string>
+</resources>

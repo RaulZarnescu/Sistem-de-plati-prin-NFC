@@ -1,58 +1,9 @@
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
-
-    <!-- Acces la cipul NFC fizic al telefonului -->
-    <uses-permission android:name="android.permission.NFC" />
-    <!-- Biometrie pentru confirmarea platilor peste 100 RON -->
-    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
-
-    <!-- Aplicatia nu apare pe telefoane fara NFC sau fara HCE -->
-    <uses-feature android:name="android.hardware.nfc" android:required="true" />
-    <uses-feature android:name="android.hardware.nfc.hce" android:required="true" />
-
-    <application
-        android:allowBackup="true"
-        android:dataExtractionRules="@xml/data_extraction_rules"
-        android:fullBackupContent="@xml/backup_rules"
-        android:icon="@mipmap/ic_launcher"
-        android:label="sistem-plata-nfc"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.Sistemplatanfc"
-        tools:targetApi="31">
-
-        <!-- Ecranul principal -->
-        <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:label="sistem-plata-nfc"
-            android:theme="@style/Theme.Sistemplatanfc">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-
-        <!--
-            Serviciul HCE - "cardul nostru virtual".
-            Android il porneste automat in fundal cand telefonul
-            e atins de un POS care trimite AID-ul F1C71V3B4NK01.
-            Nu necesita ca aplicatia sa fie deschisa de utilizator.
-        -->
-        <service
-            android:name=".hce.PaymentHceService"
-            android:exported="true"
-            android:permission="android.permission.BIND_NFC_SERVICE">
-            <intent-filter>
-                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-            <meta-data
-                android:name="android.nfc.cardemulation.host_apdu_service"
-                android:resource="@xml/apduservice" />
-        </service>
-
-    </application>
-
-</manifest>
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/hce_service_description"
+    android:requireDeviceUnlock="false">
+    <aid-group
+        android:category="payment"
+        android:description="@string/hce_aid_group_description">
+        <aid-filter android:name="F1C71V3B4NK01" />
+    </aid-group>
+</host-apdu-service>
