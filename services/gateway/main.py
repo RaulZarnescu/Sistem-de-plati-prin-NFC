@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager
 import uuid
 import time
 import redis.asyncio as aioredis
+from datetime import datetime
 # Typing — pentru a specifica tipuri de date mai complexe
 # Optional = un câmp care poate lipsi (e opțional)
 from typing import Optional
@@ -34,7 +35,7 @@ redis_client: Optional[aioredis.Redis] = None
 
 # Pydantic — pentru definirea structurii datelor așteptate
 # BaseModel = clasa de bază pentru orice "model" de date
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 
@@ -193,6 +194,15 @@ class TransactionData(BaseModel):
     # Timestamp-ul POS-ului în format ISO 8601
     # Ex: "2026-04-10T14:30:00Z"
     terminal_timestamp: str = Field(..., description="Timestamp-ul POS (ISO 8601)")
+
+    @field_validator("terminal_timestamp")
+    @classmethod
+    def validate_timestamp(cls, v: str) -> str:
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return v
+        except ValueError:
+            raise ValueError("terminal_timestamp trebuie să fie ISO 8601 valid")
 
 
 class CryptogramData(BaseModel):

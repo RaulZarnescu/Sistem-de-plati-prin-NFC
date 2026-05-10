@@ -28,6 +28,9 @@ services:
     # Numele containerului (vizibil în "docker compose ps")
     container_name: nfc-gateway
     
+    ports:
+      - "8001:8001"  # DEV ONLY — remove in production
+
     expose:
       - "8001"             # accesibil doar intern, prin NGINX
       

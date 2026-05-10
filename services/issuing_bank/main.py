@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
@@ -106,6 +106,15 @@ class TransactionData(BaseModel):
     currency: str = Field(..., description="Moneda (ex: RON)")
     pos_nonce: str = Field(..., description="Nonce generat de POS")
     terminal_timestamp: str = Field(..., description="Timestamp terminal")
+    
+    @field_validator("terminal_timestamp")
+    @classmethod
+    def validate_timestamp(cls, v: str) -> str:
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return v
+        except ValueError:
+            raise ValueError("terminal_timestamp trebuie să fie ISO 8601 valid")
 
 class CryptogramData(BaseModel):
     mac: str = Field(..., description="HMAC-SHA256")
