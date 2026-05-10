@@ -7,7 +7,7 @@
 #   3. Returnează datele cardului real (PAN, Expiration Date)
 # ============================================================
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -102,23 +102,23 @@ TOKEN_VAULT = {
     "4000000000000001": {
         "pan": "4000001111111111",
         "exp_month": "12", "exp_year": "28",
-        "risk_level": "0"
+        "risk_level": 0
     },
     "TEST-STEP-UP-001": {
         "pan": "4222222222222222",
         "exp_month": "12", "exp_year": "28",
-        "risk_level": "55"
+        "risk_level": 55
     },
     # Banca B (prefix 5000 — Mastercard Fictive Bank B)
     "5000000000000002": {
         "pan": "5000002222222222",
         "exp_month": "10", "exp_year": "27",
-        "risk_level": "0"
+        "risk_level": 0
     },
     "5000000000000003": {
         "pan": "5000003333333333",
         "exp_month": "06", "exp_year": "29",
-        "risk_level": "0"
+        "risk_level": 0
     },
 }
 
@@ -132,7 +132,7 @@ class TokenLookupResponse(BaseModel):
     pan: str = Field(..., description="Primary Account Number (Card Real)")
     exp_month: str = Field(..., description="Luna expirării (MM)")
     exp_year: str = Field(..., description="Anul expirării (YY)")
-    risk_level: Optional[str] = Field("0", description="Nivelul de risc al token-ului")
+    risk_level: int = Field(..., description="Nivelul de risc al token-ului")
 
 # --- ENDPOINT-URI ---
 
@@ -147,7 +147,7 @@ async def health_check():
     }
 
 @app.post("/api/v1/tokens/detokenize", response_model=TokenLookupResponse)
-async def detokenize(request: Request, payload: TokenLookupRequest):
+async def detokenize(payload: TokenLookupRequest):
     """
     Caută DPAN-ul în seif și returnează datele reale ale cardului.
     """
@@ -184,7 +184,7 @@ async def detokenize(request: Request, payload: TokenLookupRequest):
         pan=card_data["pan"],
         exp_month=card_data["exp_month"],
         exp_year=card_data["exp_year"],
-        risk_level=card_data.get("risk_level", "0")
+        risk_level=card_data.get("risk_level", 0)
     )
 
 # --- PORNIRE ---

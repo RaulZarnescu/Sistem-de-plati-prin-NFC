@@ -28,13 +28,9 @@ services:
     # Numele containerului (vizibil în "docker compose ps")
     container_name: nfc-gateway
     
-    # "ports" = deschide portul containerului către calculatorul tău
-    # Format: "PORT_HOST:PORT_CONTAINER"
-    # "8001:8001" = portul 8001 de pe calculatorul tău → portul 8001 din container
-    # Astfel poți accesa: http://localhost:8001
-    ports:
-      - "8001:8001"
-    
+    expose:
+      - "8001"             # accesibil doar intern, prin NGINX
+      
     # "environment" = variabile de mediu injectate în container
     # Citim valorile din fișierul .env (definit mai jos la "env_file")
     environment:
@@ -87,8 +83,8 @@ services:
       context: ./services/tsp
       dockerfile: Dockerfile
     container_name: nfc-tsp
-    ports:
-      - "8002:8002"
+    expose:
+      - "8002"             # intern doar — accesat prin gateway, nu direct din exterior
     environment:
       - ENVIRONMENT=${ENVIRONMENT}
       - TSP_PORT=${TSP_PORT}
@@ -110,8 +106,8 @@ services:
       context: ./services/card_network
       dockerfile: Dockerfile
     container_name: nfc-card-network
-    ports:
-      - "8003:8003"
+    expose:
+      - "8003"             # intern doar — apelat de gateway, nu expus public
     environment:
       - ENVIRONMENT=${ENVIRONMENT}
       - CARD_NETWORK_PORT=${CARD_NETWORK_PORT}
@@ -133,8 +129,8 @@ services:
       context: ./services/issuing_bank
       dockerfile: Dockerfile
     container_name: nfc-issuing-bank
-    ports:
-      - "8004:8004"
+    expose:
+      - "8004"             # intern doar — apelat de card-network, nu expus public
     environment:
       - ENVIRONMENT=${ENVIRONMENT}
       - ISSUING_BANK_PORT=${ISSUING_BANK_PORT}
@@ -154,13 +150,16 @@ services:
   issuing-bank-b:
     build: ./services/issuing_bank_b
     container_name: nfc-issuing-bank-b
-    ports:
-      - "${ISSUING_BANK_B_PORT:-8006}:8006"
+    expose:
+      - "8006"             # intern doar — apelat de card-network, nu expus public
     environment:
       - ISSUING_BANK_HMAC_MASTER_KEY=${ISSUING_BANK_B_HMAC_MASTER_KEY}
       - ENVIRONMENT=${ENVIRONMENT:-development}
+    env_file:
+      - .env
     networks:
       - payment-network
+    restart: unless-stopped
     volumes:
       - ./services/issuing_bank_b:/app
       - ./shared:/app/shared
@@ -187,6 +186,22 @@ services:
       - ./services/dashboard:/app
       - ./shared:/app/shared
 
+  # ============================================================
+  # NGINX — Reverse Proxy cu mTLS
+  # ============================================================
+  nginx:
+    image: nginx:alpine
+    container_name: nfc-nginx
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - gateway
+    networks:
+      - payment-network
 
   # ============================================================
   # REDIS MASTER — Nodul principal Redis
@@ -215,9 +230,9 @@ services:
       --appendonly yes
       --appendfsync everysec
     
-    ports:
-      - "6379:6379"
-    
+    expose:
+      - "6379"             # intern doar — accesat de gateway, nu expus public
+
     # "healthcheck" = Docker verifică periodic dacă Redis e gata
     # Dacă healthcheck-ul pică, containerele "depends_on" așteaptă
     healthcheck:

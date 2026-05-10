@@ -59,7 +59,7 @@ build/
 *.swp
 *.swo
 *~
-
+.claude
 
 # --- SISTEME DE OPERARE -------------------------------------
 # Fișiere generate automat de macOS / Windows
@@ -76,3 +76,11 @@ docker-volumes/
 # --- LOGURI -------------------------------------------------
 *.log
 logs/
+
+
+# --- CERTIFICATE -------------------------------------------------
+certs/*.key
+certs/*.crt
+certs/*.csr
+certs/*.srl
+!certs/.gitkeep
