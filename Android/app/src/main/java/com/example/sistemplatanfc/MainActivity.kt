@@ -2,8 +2,8 @@ package com.example.sistemplatanfc
 
 import android.os.Bundle
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,8 +22,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.sistemplatanfc.data.CardManager
 import com.example.sistemplatanfc.model.BankCard
+import com.example.sistemplatanfc.utils.BiometricHelper
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
@@ -36,7 +37,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    WalletScreen()
+                    WalletScreen(activity = this)
                 }
             }
         }
@@ -44,20 +45,35 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun WalletScreen() {
+fun WalletScreen(activity: AppCompatActivity) {
     val cards = CardManager.cards
     val activeCard = cards.find { it.isActive }
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     Scaffold(
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = { 
-                    Toast.makeText(context, "Meniu Adăugare Card (În curând)", Toast.LENGTH_SHORT).show()
-                },
-                containerColor = MaterialTheme.colorScheme.primary
-            ) {
-                Icon(Icons.Default.Add, contentDescription = "Adaugă Card")
+            Column(horizontalAlignment = Alignment.End) {
+                // Buton pentru reîmprospătare (Simulare API)
+                SmallFloatingActionButton(
+                    onClick = {
+                        Toast.makeText(context, "Se preiau cardurile din backend...", Toast.LENGTH_SHORT).show()
+                        // Aici ar veni apelul real: RetrofitClient.instance.getCards()
+                    },
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                ) {
+                    Text("🔄")
+                }
+
+                FloatingActionButton(
+                    onClick = { 
+                        Toast.makeText(context, "Meniu Adăugare Card (În curând)", Toast.LENGTH_SHORT).show()
+                    },
+                    containerColor = MaterialTheme.colorScheme.primary
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "Adaugă Card")
+                }
             }
         }
     ) { paddingValues ->
@@ -78,7 +94,17 @@ fun WalletScreen() {
                         card = card,
                         isSelected = card.isActive,
                         onSelect = {
-                            CardManager.setActiveCard(card.id)
+                            // Înainte de a schimba cardul activ, cerem autentificare biometrică
+                            BiometricHelper.showBiometricPrompt(
+                                activity = activity,
+                                onSuccess = {
+                                    CardManager.setActiveCard(card.id)
+                                    Toast.makeText(context, "Card activat: ${card.bankName}", Toast.LENGTH_SHORT).show()
+                                },
+                                onError = { error ->
+                                    Toast.makeText(context, "Eroare: $error", Toast.LENGTH_SHORT).show()
+                                }
+                            )
                         }
                     )
                 }
