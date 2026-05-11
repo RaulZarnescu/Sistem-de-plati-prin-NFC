@@ -112,22 +112,3 @@ def verify_mac(
 
     # Comparație în timp constant (protecție Timing Attack)
     return hmac.compare_digest(expected_mac, received_mac)
-
-
-def amount_to_cents(amount: float) -> int:
-    """
-    Convertește suma din format float (150.00) în cenți întregi (15000).
-
-    De ce convertim la cenți?
-    Aritmetica cu float e imprecisă:
-        >>> 0.1 + 0.2
-        0.30000000000000004  ← NU 0.3!
-
-    Dacă am calcula MAC-ul pe "150.0" vs "150.00" am obține
-    rezultate diferite. Lucrând cu întregi (cenți) eliminăm
-    ambiguitatea completamente.
-
-    Exemplu: 150.00 RON → 15000 bani
-    """
-    # round() previne erori de floating point (ex: 150.005 * 100 = 15000.499...)
-    return round(amount * 100)

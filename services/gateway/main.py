@@ -26,16 +26,18 @@ from contextlib import asynccontextmanager
 import uuid
 import time
 import redis.asyncio as aioredis
-
-redis_client: aioredis.Redis = None
-
-# Pydantic — pentru definirea structurii datelor așteptate
-# BaseModel = clasa de bază pentru orice "model" de date
-from pydantic import BaseModel, Field
-
+from datetime import datetime
 # Typing — pentru a specifica tipuri de date mai complexe
 # Optional = un câmp care poate lipsi (e opțional)
 from typing import Optional
+
+redis_client: Optional[aioredis.Redis] = None
+
+# Pydantic — pentru definirea structurii datelor așteptate
+# BaseModel = clasa de bază pentru orice "model" de date
+from pydantic import BaseModel, Field, field_validator
+
+
 
 # os — pentru a citi variabilele de mediu (din .env)
 import os
@@ -179,9 +181,8 @@ class TransactionData(BaseModel):
     Datele tranzacției primite de la POS.
     Corespunde câmpului "transaction" din JSON-ul de request.
     """
-    # float = număr cu zecimale (ex: 150.00)
     # Field() adaugă validări și documentație extra
-    amount: float = Field(..., gt=0, description="Suma tranzacției (trebuie să fie > 0)")
+    amount: int = Field(..., gt=0, description="Suma tranzacției in bani (trebuie să fie > 0)")
     
     # str = șir de caractere
     currency: str = Field(..., min_length=3, max_length=3, description="Codul monedei (ex: RON)")
@@ -193,6 +194,15 @@ class TransactionData(BaseModel):
     # Timestamp-ul POS-ului în format ISO 8601
     # Ex: "2026-04-10T14:30:00Z"
     terminal_timestamp: str = Field(..., description="Timestamp-ul POS (ISO 8601)")
+
+    @field_validator("terminal_timestamp")
+    @classmethod
+    def validate_timestamp(cls, v: str) -> str:
+        try:
+            datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return v
+        except ValueError:
+            raise ValueError("terminal_timestamp trebuie să fie ISO 8601 valid")
 
 
 class CryptogramData(BaseModel):
@@ -291,8 +301,6 @@ async def authorize_payment(
     4. Rutare către TSP → Card Network → Issuing Bank
     5. Returnare răspuns la POS
     
-    DEOCAMDATĂ: implementăm doar validarea header-elor.
-    Restul logicii se adaugă în pașii următori.
     """
     
     # --- PASUL 1: Validare Headers ---------------------------
@@ -319,7 +327,7 @@ async def authorize_payment(
                 "action_required": "NONE"
             }
         )
-    
+
     if not terminal_id:
         logger.warning(
             "Cerere fără X-Terminal-Id",
@@ -334,18 +342,35 @@ async def authorize_payment(
                 "action_required": "NONE"
             }
         )
-    
-    # Logăm primirea cererii (audit trail)
-    logger.info(
-        f"Cerere de autorizare primită de la terminal {terminal_id}",
-        extra={
-            "event_type": "TX_INITIATED",
-            "terminal_id": terminal_id,
-            "trace_id": idempotency_key,
-        }
-    )
-    
+
+    # Validare mTLS — CN din certificat trebuie să coincidă cu Terminal-Id
+    # NGINX garantează că X-SSL-Client-CN vine din certificatul TLS, nu din request body.
+    # Un POS care prezintă cert POS-BUC-001 poate activa DOAR ca terminal POS-BUC-001.
+    ssl_client_dn = request.headers.get("X-SSL-Client-DN", "")
+    cn_match = re.search(r"CN=([^,/]+)", ssl_client_dn)
+    ssl_client_cn = cn_match.group(1).strip() if cn_match else None
+
+    if ssl_client_cn and ssl_client_cn != terminal_id:
+        logger.warning(
+            f"Mismatch CN certificat vs Terminal-Id: cert={ssl_client_cn}, header={terminal_id}",
+            extra={
+                "event_type": "MTLS_CN_MISMATCH",
+                "terminal_id": terminal_id,
+                "trace_id": idempotency_key
+            }
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_code": "CERTIFICATE_MISMATCH",
+                "message": "Identitatea terminalului nu corespunde certificatului.",
+                "action_required": "CONTACT_SUPPORT"
+            }
+        )
+
     # --- FAIL-CLOSED: Validare Redis ---
+    # Trebuie să fie ÎNAINTEA oricărei operații Redis (blacklist, rate limiting, idempotență).
+    # Dacă Redis e jos, respingem cererea — este preferabil față de a procesa fără protecții.
     if not redis_client:
         logger.error("Redis indisponibil. Respingere cerere (Fail-Closed).", extra={"event_type": "FAIL_CLOSED"})
         raise HTTPException(
@@ -357,6 +382,32 @@ async def authorize_payment(
                 "action_required": "NONE"
             }
         )
+
+    # Blacklist Redis — revocarea operațională (complement la revocarea PKI)
+    is_revoked = await redis_client.sismember("revoked_terminals", terminal_id)
+    if is_revoked:
+        logger.warning(
+            f"Terminal revocat a încercat conexiunea: {terminal_id}",
+            extra={"event_type": "REVOKED_TERMINAL_BLOCKED", "terminal_id": terminal_id}
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_code": "TERMINAL_REVOKED",
+                "message": "Terminal dezactivat. Contactați suportul.",
+                "action_required": "CONTACT_SUPPORT"
+            }
+        )
+
+    # Logăm primirea cererii (audit trail)
+    logger.info(
+        f"Cerere de autorizare primită de la terminal {terminal_id}",
+        extra={
+            "event_type": "TX_INITIATED",
+            "terminal_id": terminal_id,
+            "trace_id": idempotency_key,
+        }
+    )
 
     # --- PASUL 2: Rate Limiting (Token Bucket per terminal. Max 2 req/sec)
     rate_key = f"rate:{terminal_id}:{int(time.time())}"
@@ -406,6 +457,10 @@ async def authorize_payment(
                         "action_required": "RETRY_LATER"
                     }
                 )
+            elif cached_val is None:
+                # Cheia a expirat între verificare și citire — tratăm ca nouă cerere
+                logger.warning("Idempotency key expirat între set și get", extra={"event_type": "IDEMP_KEY_EXPIRED", "trace_id": idempotency_key})
+                raise HTTPException(status_code=503, detail={"error_code": "IDEMPOTENCY_STORE_DOWN", "retry_after_ms": 1000})
             
             # Altfel înseamnă că tranzacția s-a terminat anterior și avem răspunsul JSON cached.
             logger.info(
@@ -501,7 +556,7 @@ async def authorize_payment(
     card_network_url = "http://card-network:8003/api/v1/transactions/route"
     card_network_payload = {
         "pan": pan,
-        "risk_level": tsp_data.get("risk_level", "0"),
+        "risk_level": tsp_data.get("risk_level", 0),
         "transaction": payment.transaction.model_dump(),
         "cryptogram": payment.cryptogram.model_dump(),
         "idempotency_key": idempotency_key,
@@ -538,11 +593,6 @@ async def authorize_payment(
         
         bank_data = card_network_response.json()
         
-        logger.info(
-            "Card Network a aprobat tranzacția cu succes.",
-            extra={"event_type": "CARD_NETWORK_TRANSACTION_APPROVED", "trace_id": idempotency_key, "terminal_id": terminal_id}
-        )
-        
     except httpx.TimeoutException:
         logger.error(
             "Timeout (1200ms) la comunicarea cu Card Network",
@@ -578,17 +628,34 @@ async def authorize_payment(
         )
         raise HTTPException(status_code=503, detail="Card Network connection failed")
 
+    # --- INSPECȚIE BODY (HTTP 200 nu implică APPROVED) ---
+    # DECLINED și APPROVED sunt ambele HTTP 200 — trebuie inspectat câmpul status din body.
+    bank_status = bank_data.get("status", "DECLINED")
+
+    if bank_status == "DECLINED":
+        logger.warning(
+            f"Tranzacție RESPINSĂ de bancă. Risk score: {bank_data.get('risk_score', 'N/A')}",
+            extra={"event_type": "TX_DECLINED", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+    else:
+        logger.info(
+            "Tranzacție APROBATĂ de bancă.",
+            extra={"event_type": "CARD_NETWORK_TRANSACTION_APPROVED", "trace_id": idempotency_key, "terminal_id": terminal_id}
+        )
+
     final_response = PaymentResponse(
-        status=bank_data.get("status", "DECLINED"),
+        status=bank_status,
         transaction_id=bank_data.get("transaction_id", f"TXN-{uuid.uuid4().hex[:12].upper()}"),
         auth_code=bank_data.get("auth_code"),
         risk_score=bank_data.get("risk_score", 0),
         processed_at=bank_data.get("processed_at", datetime.now(timezone.utc).isoformat())
     )
-    
-    # Salvăm rezultatul final în Redis pentru 24h
-    await redis_client.setex(idemp_key, 86400, final_response.model_dump_json())
-        
+
+    # DECLINED se cachează 30 min (nu 24h) — permite retry după Risk Decay
+    # APPROVED se cachează 24h pentru idempotență completă
+    cache_ttl = 1800 if bank_status == "DECLINED" else 86400
+    await redis_client.setex(idemp_key, cache_ttl, final_response.model_dump_json())
+
     return final_response
 
 # --- PORNIRE ---

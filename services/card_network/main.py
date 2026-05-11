@@ -71,8 +71,12 @@ AUTHORIZE_PATH = "/api/v1/transactions/authorize"
 
 
 def find_bank_url(pan: str, table: dict) -> str | None:
-    """Caută cel mai specific prefix IIN în routing table (longest-prefix-match)."""
-    for length in (6, 4, 2, 1):
+    """Caută cel mai specific prefix IIN în routing table (longest-prefix-match).
+
+    Caută de la 6 cifre (specific) la 1 cifră (fallback general), toate lungimile.
+    Ex: pentru PAN "400000...", verifică '400000', '40000', '4000', '400', '40', '4'.
+    """
+    for length in range(6, 0, -1):
         prefix = pan[:length]
         if prefix in table:
             return table[prefix]
@@ -82,7 +86,7 @@ def find_bank_url(pan: str, table: dict) -> str | None:
 # --- MODELE ---
 
 class TransactionData(BaseModel):
-    amount: float
+    amount: int
     currency: str
     pos_nonce: str
     terminal_timestamp: str
@@ -93,7 +97,7 @@ class CryptogramData(BaseModel):
 
 class CardNetworkRequest(BaseModel):
     pan: str
-    risk_level: Optional[str] = "0"
+    risk_level: int = 0
     transaction: TransactionData
     cryptogram: CryptogramData
     idempotency_key: str
@@ -174,6 +178,8 @@ async def route_transaction(payload: CardNetworkRequest):
                 "Issuing Bank cere Step-Up. Propagare către Gateway.",
                 extra={"event_type": "STEP_UP_PROPAGATED", "trace_id": trace_id}
             )
+            # TODO: PoC — idemp_key rămâne "PROCESSING" cu TTL 30s.
+            # Producție: salvează starea CHALLENGE_REQUIRED în Redis ca stare finală.
             raise HTTPException(
                 status_code=401,
                 detail=bank_response.json().get("detail", {})
@@ -181,12 +187,16 @@ async def route_transaction(payload: CardNetworkRequest):
 
         bank_response.raise_for_status()
 
+        response_data = bank_response.json()
+        routed_status = response_data.get("status", "UNKNOWN")
+        log_event = "ROUTING_SUCCESS" if routed_status == "APPROVED" else "ROUTING_COMPLETED"
+
         logger.info(
-            "Răspuns Issuing Bank primit și propagat cu succes.",
-            extra={"event_type": "ROUTING_SUCCESS", "trace_id": trace_id}
+            f"Răspuns Issuing Bank propagat. Status: {routed_status}",
+            extra={"event_type": log_event, "trace_id": trace_id}
         )
 
-        return bank_response.json()
+        return response_data
 
     except httpx.TimeoutException:
         logger.error(
