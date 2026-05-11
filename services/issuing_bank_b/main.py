@@ -28,7 +28,8 @@ from shared.crypto_utils import verify_mac
 
 load_dotenv()
 
-HMAC_KEY = os.getenv("ISSUING_BANK_HMAC_MASTER_KEY", "").encode("utf-8")
+_key_hex = os.getenv("ISSUING_BANK_HMAC_MASTER_KEY", "")
+HMAC_KEY = bytes.fromhex(_key_hex) if _key_hex else b""
 
 # --- CONFIGURAREA LOG-URILOR CU MASCARE PII ---
 

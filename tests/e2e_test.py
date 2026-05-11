@@ -43,8 +43,11 @@ import httpx
 GATEWAY_URL = os.getenv("TEST_GATEWAY_URL", "http://localhost:8001")
 
 # Cheile HMAC — disponibile în container via env_file: .env
-HMAC_KEY_A = os.getenv("ISSUING_BANK_HMAC_MASTER_KEY", "").encode("utf-8")
-HMAC_KEY_B = os.getenv("ISSUING_BANK_B_HMAC_MASTER_KEY", "").encode("utf-8")
+_hex_a = os.getenv("ISSUING_BANK_HMAC_MASTER_KEY", "")
+HMAC_KEY_A = bytes.fromhex(_hex_a) if _hex_a else b""
+
+_hex_b = os.getenv("ISSUING_BANK_B_HMAC_MASTER_KEY", "")
+HMAC_KEY_B = bytes.fromhex(_hex_b) if _hex_b else b""
 
 # Terminal ID folosit în teste
 TERMINAL_ID = "POS-E2E-TEST-001"
