@@ -109,6 +109,12 @@ TOKEN_VAULT = {
         "exp_month": "12", "exp_year": "28",
         "risk_level": 55
     },
+    # Token cu risc 90 — folosit de TC-11 pentru a valida decizia DECLINED (fraud > 75)
+    "TEST-DECLINE-001": {
+        "pan": "4444444444444444",
+        "exp_month": "12", "exp_year": "28",
+        "risk_level": 90
+    },
     # Banca B (prefix 5000 — Mastercard Fictive Bank B)
     "5000000000000002": {
         "pan": "5000002222222222",

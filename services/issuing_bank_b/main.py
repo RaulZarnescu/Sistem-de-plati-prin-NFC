@@ -23,13 +23,19 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+import redis.asyncio as aioredis
+
+redis_client: Optional[aioredis.Redis] = None
 
 from shared.crypto_utils import verify_mac
 
 load_dotenv()
 
 _key_hex = os.getenv("ISSUING_BANK_HMAC_MASTER_KEY", "")
-HMAC_KEY = bytes.fromhex(_key_hex) if _key_hex else b""
+try:
+    HMAC_KEY = bytes.fromhex(_key_hex) if _key_hex else b""
+except ValueError:
+    HMAC_KEY = b""
 
 # --- CONFIGURAREA LOG-URILOR CU MASCARE PII ---
 
@@ -82,28 +88,10 @@ handler.setFormatter(MaskedJSONFormatter())
 if not logger.handlers:
     logger.addHandler(handler)
 
-# Stocare ATC per PAN pentru protecție anti-replay (Cap. 7.6, T1)
-# LIMITARE PoC: ATC-ul trebuie stocat persistent (PostgreSQL cu FOR UPDATE).
-# La restart Docker, protecția anti-replay se pierde complet.
-# Producție: SELECT last_atc FROM accounts WHERE pan = ? FOR UPDATE
-last_atc_store: dict[str, int] = {}
-
-# Store-uri Fraud Engine la nivel de MODUL — acumulează date între cereri.
-# LIMITARE PoC: se resetează la restart Docker — producție: Redis/PostgreSQL
-
-# pan -> lista de unix timestamps (pentru Velocity, Cap. 6.1)
-transaction_history: dict[str, list[float]] = {}
-
-# pan -> lista de sume (pentru media Amount Deviation, Cap. 6.2)
-amount_history: dict[str, list[int]] = {}
-
-# pan -> (scor_acumulat, timestamp_ultima_tranzactie) (pentru Risk Decay, Cap. 6.3)
-risk_profiles: dict[str, tuple[float, datetime]] = {}
-
 # --- MODELE PYDANTIC ---
 
 class TransactionData(BaseModel):
-    amount: int = Field(..., description="Suma tranzacției in bani")
+    amount: int = Field(..., description="Suma tranzacției în cenți (ex: 5000 pentru 50 RON)")
     currency: str = Field(..., description="Moneda (ex: RON)")
     pos_nonce: str = Field(..., description="Nonce generat de POS")
     terminal_timestamp: str = Field(..., description="Timestamp terminal")
@@ -123,7 +111,7 @@ class CryptogramData(BaseModel):
 
 class IssuingBankRequest(BaseModel):
     pan: str = Field(..., description="Primary Account Number (Decriptat de TSP)")
-    risk_level: int = Field(..., description="Scorul de risc al DPAN-ului de la TSP")
+    risk_level: int = Field(0, description="Scorul de risc al DPAN-ului de la TSP")
     transaction: TransactionData
     cryptogram: CryptogramData
     idempotency_key: str = Field(..., description="ID-ul unic de idempotență")
@@ -141,6 +129,7 @@ class IssuingBankResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global redis_client
     # Suprascriem logger-ele implicite din uvicorn pentru a folosi formatul JSON
     for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
         u_logger = logging.getLogger(logger_name)
@@ -151,8 +140,29 @@ async def lifespan(app: FastAPI):
     
     if not HMAC_KEY:
         logger.error("ISSUING_BANK_HMAC_MASTER_KEY lipsește din mediu!", extra={"event_type": "CONFIG_ERROR"})
-        
+
+    try:
+        redis_client = aioredis.Redis(
+            host=os.getenv("REDIS_HOST", "redis-master"),
+            port=int(os.getenv("REDIS_PORT", 6379)),
+            password=os.getenv("REDIS_PASSWORD"),
+            decode_responses=True
+        )
+        await redis_client.ping()
+        logger.info(
+            "Conexiune Redis stabilită",
+            extra={"event_type": "REDIS_CONNECTED"}
+        )
+    except Exception as e:
+        logger.error(
+            f"Redis indisponibil la startup: {e}",
+            extra={"event_type": "REDIS_ERROR"}
+        )
+
     yield
+
+    if redis_client:
+        await redis_client.aclose()
 
 app = FastAPI(title="NFC Issuing Bank B", version="1.0.0", lifespan=lifespan)
 
@@ -208,11 +218,32 @@ async def authorize_transaction(payload: IssuingBankRequest):
         "Criptograma validată cu succes. Integritatea sumei este confirmată.",
         extra={"event_type": "CRYPTO_VALIDATED", "trace_id": trace_id}
     )
-    
+
+    if not redis_client:
+        logger.error(
+            "Redis indisponibil. Validare ATC imposibilă.",
+            extra={"event_type": "REDIS_ERROR", "trace_id": trace_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "SERVICE_UNAVAILABLE",
+                "message": "Serviciu temporar indisponibil.",
+                "action_required": "RETRY_LATER"
+            }
+        )
+
     # --- VALIDARE ATC (Anti-Replay, Cap. 7.6) ---
     received_atc = payload.cryptogram.atc
-    stored_atc = last_atc_store.get(payload.pan, -1)
-    
+    atc_key = f"atc:{payload.pan}"
+
+    # GET → verificăm ÎNAINTE de a scrie în Redis.
+    # GETSET (varianta anterioară) scria valoarea ÎNAINTE de check — bug:
+    # un ATC de replay suprascria valoarea legitimă din Redis.
+    # Producție: înlocuiți cu script Lua pentru atomicitate completă la concurență.
+    old_atc_raw = await redis_client.get(atc_key)
+    stored_atc = int(old_atc_raw) if old_atc_raw is not None else -1
+
     if received_atc <= stored_atc:
         logger.error(
             f"ATC invalid: primit {received_atc}, stocat {stored_atc}. Posibil Replay Attack.",
@@ -226,42 +257,61 @@ async def authorize_transaction(payload: IssuingBankRequest):
                 "action_required": "DECLINE_TRANSACTION"
             }
         )
-    
-    # ATC valid — actualizăm referința
-    last_atc_store[payload.pan] = received_atc
 
-    # --- FRAUD ENGINE COMPLET (Cap. 6.1, 6.3) ---
+    # ATC valid — scriem în Redis DUPĂ validare
+    await redis_client.set(atc_key, received_atc, ex=86400 * 30)  # TTL 30 zile
+    
+    logger.info(
+        f"ATC valid. Primit: {received_atc}, anterior: {stored_atc}.",
+        extra={"event_type": "ATC_VALIDATED", "trace_id": trace_id}
+    )
+
+    # --- FRAUD ENGINE COMPLET (Cap. 6.1, 6.2, 6.3) ---
     tsp_risk = payload.risk_level
     now = datetime.now(timezone.utc)
 
     # === RISK DECAY (Cap. 6.3) ===
-    # Aplicat ÎNAINTE de a adăuga riscul noii tranzacții
-    # Formula: RiskScore = RiskScore_curent × e^(-λΔt), λ=0.173, half-life=4h
-    stored_score, last_ts = risk_profiles.get(payload.pan, (0.0, None))
+    risk_key = f"risk:{payload.pan}"
+    risk_data = await redis_client.hgetall(risk_key)
 
-    if last_ts is not None:
+    if risk_data:
+        stored_score = float(risk_data["score"])
+        last_ts = datetime.fromisoformat(risk_data["timestamp"])
         delta_t_hours = (now - last_ts).total_seconds() / 3600
         decayed_base = stored_score * math.exp(-0.173 * delta_t_hours)
     else:
         decayed_base = 0.0
 
     # === FACTOR V — VELOCITY (W1=30) ===
-    history = transaction_history.get(payload.pan, [])
-    recent = [ts for ts in history if (now.timestamp() - ts) <= 600]
-    velocity = len(recent)  # tranzacții anterioare, fără cea curentă
+    # Redis Sorted Set: score = timestamp Unix, member = timestamp Unix ca string
+    # ZRANGEBYSCORE returnează tranzacțiile din ultimele 10 minute
+    velocity_key = f"velocity:{payload.pan}"
+    now_ts = now.timestamp()
+    window_start = now_ts - 600  # 10 minute în secunde
+
+    pipe = redis_client.pipeline()
+    # 1. Șterge tranzacțiile mai vechi de 10 minute
+    pipe.zremrangebyscore(velocity_key, 0, window_start)
+    # 2. Numără tranzacțiile rămase (anterioare celei curente)
+    pipe.zcard(velocity_key)
+    # 3. Adaugă tranzacția curentă
+    pipe.zadd(velocity_key, {str(now_ts): now_ts})
+    # 4. TTL de curățare — 20 minute (dublu față de fereastră)
+    pipe.expire(velocity_key, 1200)
+    _, velocity, _, _ = await pipe.execute()
+
     n1 = min(velocity / 5.0, 1.0)
     velocity_contribution = 30 * n1
 
-    # Actualizăm istoricul după calcul
-    recent.append(now.timestamp())
-    transaction_history[payload.pan] = recent
-
     # === FACTOR A — AMOUNT DEVIATION (W2=40) ===
-    amounts = amount_history.get(payload.pan, [])
+    amount_key = f"amounts:{payload.pan}"
     current_amount = payload.transaction.amount
 
+    # Citim istoricul INAINTE sa adaugam suma curenta
+    amounts_raw = await redis_client.lrange(amount_key, 0, -1)
+    amounts = [int(x) for x in amounts_raw]
+
     if not amounts:
-        # Primul utilizator — nu avem baseline, N2=0
         n2 = 0.0
     else:
         avg_amount = sum(amounts) / len(amounts)
@@ -271,14 +321,15 @@ async def authorize_transaction(payload: IssuingBankRequest):
             ratio = current_amount / avg_amount
             raw = 1 / (1 + math.exp(-0.5 * (ratio - 1)))
             n2 = max(0.0, min(1.0, (raw - 0.5) * 2))
-            # shift cu -0.5, rescalezi × 2, clampezi la [0, 1]
-            # duce la: ratio=1 → 0.0, ratio=10 → ~0.978
 
     amount_contribution = 40 * n2
 
-    # Actualizăm istoricul sumelor după calcul
-    amounts.append(current_amount)
-    amount_history[payload.pan] = amounts
+    # Adaugam suma curenta DUPA calcul
+    pipe = redis_client.pipeline()
+    pipe.lpush(amount_key, current_amount)
+    pipe.ltrim(amount_key, 0, 99)   # pastram ultimele 100 tranzactii
+    pipe.expire(amount_key, 86400 * 30)
+    await pipe.execute()
 
     # === FACTOR L — LOCATION VELOCITY (W3=30) ===
     # TODO: Necesită coordonate GPS de la POS — neimplementat în PoC.
@@ -291,8 +342,12 @@ async def authorize_transaction(payload: IssuingBankRequest):
     new_accumulated = decayed_base + velocity_contribution + amount_contribution + location_contribution
     final_risk = int(min(new_accumulated + tsp_risk, 100))
 
-    # Salvăm scorul acumulat (fără tsp_risk — acela e proprietatea tokenului)
-    risk_profiles[payload.pan] = (new_accumulated, now)
+    # Salvăm scorul acumulat în Redis Hash
+    await redis_client.hset(risk_key, mapping={
+        "score": str(new_accumulated),
+        "timestamp": now.isoformat()
+    })
+    await redis_client.expire(risk_key, 86400 * 7)  # TTL 7 zile
 
     logger.info(
         f"Fraud scored. Decay base: {decayed_base:.1f}, Velocity: +{velocity_contribution:.1f} (T={velocity}), "

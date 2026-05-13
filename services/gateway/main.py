@@ -408,17 +408,33 @@ async def authorize_payment(
             "trace_id": idempotency_key,
         }
     )
+    
+    # --- PASUL 2: Rate Limiting (Sliding Window Log per terminal) ---
+    # Sliding Window elimină problema Fixed Window (granița secundei).
+    # ZADD + ZREMRANGEBYSCORE + ZCARD = atomic via pipeline.
+    rate_key = f"rate:{terminal_id}"
+    now_ts = time.time()
+    window_start = now_ts - 1.0  # fereastră de 1 secundă
 
-    # --- PASUL 2: Rate Limiting (Token Bucket per terminal. Max 2 req/sec)
-    rate_key = f"rate:{terminal_id}:{int(time.time())}"
-    count = await redis_client.incr(rate_key)
-    if count == 1:
-        await redis_client.expire(rate_key, 1)
-        
+    pipe = redis_client.pipeline()
+    # 1. Șterge cererile mai vechi de 1 secundă
+    pipe.zremrangebyscore(rate_key, 0, window_start)
+    # 2. Adaugă cererea curentă (score = timestamp, member = timestamp ca string)
+    pipe.zadd(rate_key, {str(now_ts): now_ts})
+    # 3. Numără cererile din fereastră
+    pipe.zcard(rate_key)
+    # 4. TTL de curățare
+    pipe.expire(rate_key, 2)
+    _, _, count, _ = await pipe.execute()
+
     if count > 2:
         logger.warning(
             f"Rate limit depășit pentru terminalul {terminal_id}",
-            extra={"event_type": "RATE_LIMIT_EXCEEDED", "terminal_id": terminal_id, "trace_id": idempotency_key}
+            extra={
+                "event_type": "RATE_LIMIT_EXCEEDED",
+                "terminal_id": terminal_id,
+                "trace_id": idempotency_key
+            }
         )
         raise HTTPException(
             status_code=429,

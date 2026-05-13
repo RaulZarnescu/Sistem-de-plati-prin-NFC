@@ -23,6 +23,9 @@ Scenarii acoperite:
   TC-07  Idempotență (retrimite TC-02)     → 200 APPROVED (din cache)
   TC-08  Lipsă X-Idempotency-Key          → 400 MISSING_IDEMPOTENCY_KEY
   TC-09  Lipsă X-Terminal-Id              → 400 MISSING_TERMINAL_ID
+  TC-10  Rate Limiting (3 req < 1s)        → 429 RATE_LIMIT_EXCEEDED
+  TC-11  DECLINED (tsp_risk=90 > 75)      → 200 status:DECLINED
+  TC-12  Fail-Closed Redis               → PowerShell: tests/redis_failover_test.ps1
 ============================================================
 """
 
@@ -181,13 +184,21 @@ def preflight():
 def main():
     preflight()
 
-    # Păstrăm datele din unele teste pentru a le refolosi în altele
-    tc01_atc = 100         # folosit în TC-05 (replay)
+    # ATC-uri bazate pe timestamp Unix — garantat crescătoare între rulări succesive.
+    # Redis persistă ATC-urile (AOF), deci rularea 2 cu aceiași ATC statici (100, 200)
+    # ar fi respinsă ca replay. time.time() crește la fiecare rulare → ATC nou, valid.
+    _atc_base = int(time.time())
+    tc01_atc  = _atc_base        # folosit și în TC-05 (replay)
+    atc2      = _atc_base + 1
+    atc3      = _atc_base + 2
+    atc4      = _atc_base + 3    # TC-04: MAC tampered — banca nu ajunge la ATC check
+    atc11     = _atc_base + 10   # TC-11: DECLINED — offset mare, nu intră în conflict cu atc2..4
+
     tc02_idemp_key = None  # folosit în TC-07 (idempotency)
     tc02_body = None       # folosit în TC-07
 
     # ----------------------------------------------------------
-    print("\n📡 [0/9] Conectivitate Gateway")
+    print("\n📡 [0/12] Conectivitate Gateway")
     run_test(
         "TC-00  Health Check",
         "get", f"{GATEWAY_URL}/health",
@@ -198,8 +209,8 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n💳 [1/9] Happy path — Visa (Bank A, prefix 4)")
-    ts1, nonce1, atc1 = now_iso(), unique_nonce(), tc01_atc
+    print("\n💳 [1/12] Happy path — Visa (Bank A, prefix 4)")
+    ts1, nonce1, atc1 = now_iso(), unique_nonce(), tc01_atc  # atc1 == tc01_atc
     mac1 = compute_mac(HMAC_KEY_A, 15000, "RON", nonce1, ts1, atc1)
     run_test(
         "TC-01  Visa APPROVED",
@@ -217,8 +228,8 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n💳 [2/9] Happy path — Mastercard (Bank B, prefix 5)")
-    ts2, nonce2, atc2 = now_iso(), unique_nonce(), 200
+    print("\n💳 [2/12] Happy path — Mastercard (Bank B, prefix 5)")
+    ts2, nonce2 = now_iso(), unique_nonce()  # atc2 definit în _atc_base block de sus
     mac2 = compute_mac(HMAC_KEY_B, 5000, "RON", nonce2, ts2, atc2)
     tc02_idemp_key = unique_key()
     tc02_body = {
@@ -238,8 +249,8 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🔐 [3/9] Step-Up Authentication (risk_level=55, Bank A)")
-    ts3, nonce3, atc3 = now_iso(), unique_nonce(), 300
+    print("\n🔐 [3/12] Step-Up Authentication (risk_level=55, Bank A)")
+    ts3, nonce3 = now_iso(), unique_nonce()  # atc3 definit în _atc_base block de sus
     mac3 = compute_mac(HMAC_KEY_A, 10000, "RON", nonce3, ts3, atc3)
     run_test(
         "TC-03  CHALLENGE_REQUIRED (Step-Up)",
@@ -257,11 +268,11 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🚨 [4/9] MAC tampered — sumă alterată de atacator")
+    print("\n🚨 [4/12] MAC tampered — sumă alterată de atacator")
     # Atacatorul calculează MAC pentru 1 ban (amount=1)
     # dar trimite suma reală de 999 RON (amount=99900) în body.
     # Banca recalculează MAC cu 99900 → nepotrivire → INVALID_CRYPTOGRAM
-    ts4, nonce4, atc4 = now_iso(), unique_nonce(), 400
+    ts4, nonce4 = now_iso(), unique_nonce()  # atc4 definit în _atc_base block de sus
     mac4_tampered = compute_mac(HMAC_KEY_A, 1, "RON", nonce4, ts4, atc4)  # MAC pentru 1 ban
     run_test(
         "TC-04  INVALID_CRYPTOGRAM (MAC tampered)",
@@ -279,9 +290,9 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🔄 [5/9] ATC Replay Attack (același ATC ca TC-01)")
-    # Banca a stocat last_atc=100 după TC-01.
-    # Trimitem din nou atc=100 → received_atc (100) <= stored_atc (100) → REPLAY
+    print("\n🔄 [5/12] ATC Replay Attack (același ATC ca TC-01)")
+    # Banca a stocat last_atc=tc01_atc după TC-01.
+    # Trimitem din nou același ATC → received_atc <= stored_atc → REPLAY DETECTED.
     # TC-04 NU avansează ATC-ul (MAC eșua înainte de ATC check).
     ts5, nonce5 = now_iso(), unique_nonce()
     mac5_replay = compute_mac(HMAC_KEY_A, 15000, "RON", nonce5, ts5, tc01_atc)  # atc=100
@@ -301,7 +312,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n❓ [6/9] DPAN necunoscut în Token Vault")
+    print("\n❓ [6/12] DPAN necunoscut în Token Vault")
     ts6, nonce6 = now_iso(), unique_nonce()
     mac6 = compute_mac(HMAC_KEY_A, 5000, "RON", nonce6, ts6, 500)
     run_test(
@@ -320,7 +331,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n♻️  [7/9] Idempotență — retrimite TC-02 (răspuns din cache)")
+    print("\n♻️  [7/12] Idempotență — retrimite TC-02 (răspuns din cache)")
     # Același idempotency key ca TC-02 → Gateway returnează răspunsul stocat în Redis
     # Body-ul poate fi identic sau diferit — idempotența e per key, nu per body
     run_test(
@@ -334,7 +345,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n⚠️  [8/9] Header X-Idempotency-Key lipsă")
+    print("\n⚠️  [8/12] Header X-Idempotency-Key lipsă")
     run_test(
         "TC-08  MISSING_IDEMPOTENCY_KEY",
         "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
@@ -351,7 +362,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n⚠️  [9/9] Header X-Terminal-Id lipsă")
+    print("\n⚠️  [9/12] Header X-Terminal-Id lipsă")
     run_test(
         "TC-09  MISSING_TERMINAL_ID",
         "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
@@ -364,6 +375,72 @@ def main():
         },
         expect_status=400,
         expect_fields={"detail.error_code": "MISSING_TERMINAL_ID"},
+    )
+
+    time.sleep(INTER_TEST_SLEEP)
+
+    # ----------------------------------------------------------
+    print("\n🚦 [10/12] Rate Limiting — 3 cereri < 1s → 429 RATE_LIMIT_EXCEEDED")
+    # Terminal dedicat pentru a nu interfera cu celelalte teste.
+    # Gateway-ul limitează la 2 req/s per terminal (fereastră fixă pe secundă).
+    rl_terminal = "POS-RATELIMIT-E2E"
+
+    # Sincronizăm la chiar începutul unui nou secundă:
+    # toate cele 3 cereri trebuie să cadă în aceeași fereastră int(time.time()).
+    next_sec = int(time.time()) + 1
+    while time.time() < next_sec:
+        time.sleep(0.005)
+
+    # Cererile 1 și 2 — trec rate limiter-ul (count=1, 2),
+    # eșuează la TSP (DPAN necunoscut) → 400 INVALID_TOKEN. Normal, nu le verificăm.
+    for i in range(2):
+        with httpx.Client(timeout=5.0) as client:
+            client.post(
+                f"{GATEWAY_URL}/api/v1/payments/authorize",
+                headers={"X-Idempotency-Key": unique_key(), "X-Terminal-Id": rl_terminal},
+                json={
+                    "dpan": "9999999999999999",
+                    "transaction": {"amount": 1000, "currency": "RON",
+                                    "pos_nonce": unique_nonce(), "terminal_timestamp": now_iso()},
+                    "cryptogram": {"mac": "fakemac", "atc": i + 1},
+                }
+            )
+
+    # Cererea 3 în aceeași secundă — trebuie să primească 429 RATE_LIMIT_EXCEEDED.
+    run_test(
+        "TC-10  RATE_LIMIT_EXCEEDED (req 3/3 < 1s)",
+        "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
+        headers={"X-Idempotency-Key": unique_key(), "X-Terminal-Id": rl_terminal},
+        body={
+            "dpan": "9999999999999999",
+            "transaction": {"amount": 1000, "currency": "RON",
+                            "pos_nonce": unique_nonce(), "terminal_timestamp": now_iso()},
+            "cryptogram": {"mac": "fakemac", "atc": 3},
+        },
+        expect_status=429,
+        expect_fields={"detail.error_code": "RATE_LIMIT_EXCEEDED"},
+    )
+    time.sleep(INTER_TEST_SLEEP)
+
+    # ----------------------------------------------------------
+    print("\n🚫 [11/12] DECLINED — Fraud score > 75 (tsp_risk=90, Bank A)")
+    # TEST-DECLINE-001 → PAN 4444444444444444 → prefix 4 → Bank A → HMAC_KEY_A
+    # Prima tranzacție pentru acest PAN: decayed_base=0, velocity=0, amount_dev=0
+    # final_risk = int(min(0 + 0 + 0 + 90, 100)) = 90 > 75 → DECLINED
+    ts11, nonce11 = now_iso(), unique_nonce()
+    mac11 = compute_mac(HMAC_KEY_A, 5000, "RON", nonce11, ts11, atc11)
+    run_test(
+        "TC-11  DECLINED (fraud score > 75)",
+        "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
+        headers={"X-Idempotency-Key": unique_key(), "X-Terminal-Id": TERMINAL_ID},
+        body={
+            "dpan": "TEST-DECLINE-001",
+            "transaction": {"amount": 5000, "currency": "RON",
+                            "pos_nonce": nonce11, "terminal_timestamp": ts11},
+            "cryptogram": {"mac": mac11, "atc": atc11},
+        },
+        expect_status=200,
+        expect_fields={"status": "DECLINED"},
     )
 
     # ----------------------------------------------------------
@@ -380,6 +457,8 @@ def main():
             if not ok:
                 print(f"   • {name}: {detail}")
 
+    print("\nNOTĂ: TC-12 (Fail-Closed Redis) rulează separat din PowerShell:")
+    print("  .\\tests\\redis_failover_test.ps1")
     print("=" * 60)
     exit(0 if passed_count == total_count else 1)
 
