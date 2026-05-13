@@ -4,6 +4,6 @@
     <aid-group
         android:category="payment"
         android:description="@string/hce_aid_group_description">
-        <aid-filter android:name="F1C71V3B4NK01" />
+        <aid-filter android:name="F1000000000001" />
     </aid-group>
 </host-apdu-service>
