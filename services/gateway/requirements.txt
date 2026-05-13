@@ -33,3 +33,8 @@ redis==5.0.4
 # Gateway-ul trebuie să apeleze TSP, Bank, etc.
 # httpx e mai modern decât requests și suportă async/await
 httpx==0.27.0
+
+# Prometheus FastAPI Instrumentator — metrici și health-check
+# Necesare pentru a exporta metrici în format Prometheus (/metrics)
+# și pentru a expune endpoint-ul /health corespunzător specificațiilor
+prometheus-fastapi-instrumentator==6.1.0

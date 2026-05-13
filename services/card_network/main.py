@@ -119,6 +119,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NFC Card Network Router", version="1.0.0", lifespan=lifespan)
 
+from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app).expose(app)
 
 # --- ENDPOINTS ---
 

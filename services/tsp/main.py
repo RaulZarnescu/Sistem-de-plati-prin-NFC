@@ -18,6 +18,7 @@ import re
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
 # --- CONFIGURAREA LOG-URILOR CU MASCARE PII ---
@@ -92,6 +93,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app).expose(app)
 
 # --- MOCK DATA (Token Vault temporar) ---
 # Simulează baza de date PostgreSQL. Cheia este DPAN, valoarea este PAN și expirare.

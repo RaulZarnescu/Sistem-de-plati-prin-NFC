@@ -27,6 +27,7 @@ import redis.asyncio as aioredis
 
 redis_client: Optional[aioredis.Redis] = None
 
+
 from shared.crypto_utils import verify_mac
 
 load_dotenv()
@@ -165,6 +166,10 @@ async def lifespan(app: FastAPI):
         await redis_client.aclose()
 
 app = FastAPI(title="NFC Issuing Bank B", version="1.0.0", lifespan=lifespan)
+
+from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app).expose(app)
 
 
 @app.get("/health")

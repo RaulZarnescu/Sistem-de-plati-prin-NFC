@@ -7,6 +7,10 @@ load_dotenv()
 
 app = FastAPI(title="NFC dashboard")
 
+from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app).expose(app)
+
 @app.get("/health")
 async def health_check():
     return {

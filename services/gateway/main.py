@@ -38,7 +38,6 @@ redis_client: Optional[aioredis.Redis] = None
 from pydantic import BaseModel, Field, field_validator
 
 
-
 # os — pentru a citi variabilele de mediu (din .env)
 import os
 
@@ -168,7 +167,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from prometheus_fastapi_instrumentator import Instrumentator
 
+Instrumentator().instrument(app).expose(app)
 # --- MODELELE DE DATE (Pydantic) ----------------------------
 # Acestea definesc EXACT ce structură JSON așteptăm de la POS.
 # Pydantic validează automat: dacă lipsește un câmp obligatoriu
@@ -368,6 +369,16 @@ async def authorize_payment(
             }
         )
 
+    # Logăm primirea cererii (audit trail)
+    logger.info(
+        f"Cerere de autorizare primită de la terminal {terminal_id}",
+        extra={
+            "event_type": "TX_INITIATED",
+            "terminal_id": terminal_id,
+            "trace_id": idempotency_key,
+        }
+    )
+
     # --- FAIL-CLOSED: Validare Redis ---
     # Trebuie să fie ÎNAINTEA oricărei operații Redis (blacklist, rate limiting, idempotență).
     # Dacă Redis e jos, respingem cererea — este preferabil față de a procesa fără protecții.
@@ -382,109 +393,116 @@ async def authorize_payment(
                 "action_required": "NONE"
             }
         )
-
-    # Blacklist Redis — revocarea operațională (complement la revocarea PKI)
-    is_revoked = await redis_client.sismember("revoked_terminals", terminal_id)
-    if is_revoked:
-        logger.warning(
-            f"Terminal revocat a încercat conexiunea: {terminal_id}",
-            extra={"event_type": "REVOKED_TERMINAL_BLOCKED", "terminal_id": terminal_id}
-        )
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error_code": "TERMINAL_REVOKED",
-                "message": "Terminal dezactivat. Contactați suportul.",
-                "action_required": "CONTACT_SUPPORT"
-            }
-        )
-
-    # Logăm primirea cererii (audit trail)
-    logger.info(
-        f"Cerere de autorizare primită de la terminal {terminal_id}",
-        extra={
-            "event_type": "TX_INITIATED",
-            "terminal_id": terminal_id,
-            "trace_id": idempotency_key,
-        }
-    )
-    
-    # --- PASUL 2: Rate Limiting (Sliding Window Log per terminal) ---
-    # Sliding Window elimină problema Fixed Window (granița secundei).
-    # ZADD + ZREMRANGEBYSCORE + ZCARD = atomic via pipeline.
-    rate_key = f"rate:{terminal_id}"
-    now_ts = time.time()
-    window_start = now_ts - 1.0  # fereastră de 1 secundă
-
-    pipe = redis_client.pipeline()
-    # 1. Șterge cererile mai vechi de 1 secundă
-    pipe.zremrangebyscore(rate_key, 0, window_start)
-    # 2. Adaugă cererea curentă (score = timestamp, member = timestamp ca string)
-    pipe.zadd(rate_key, {str(now_ts): now_ts})
-    # 3. Numără cererile din fereastră
-    pipe.zcard(rate_key)
-    # 4. TTL de curățare
-    pipe.expire(rate_key, 2)
-    _, _, count, _ = await pipe.execute()
-
-    if count > 2:
-        logger.warning(
-            f"Rate limit depășit pentru terminalul {terminal_id}",
-            extra={
-                "event_type": "RATE_LIMIT_EXCEEDED",
-                "terminal_id": terminal_id,
-                "trace_id": idempotency_key
-            }
-        )
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error_code": "RATE_LIMIT_EXCEEDED",
-                "message": "Prea multe cereri. Maxim 2 cereri pe secundă.",
-                "retry_after_ms": 1000,
-                "action_required": "RETRY_LATER"
-            }
-        )
-    
-    # --- PASUL 3: Idempotență (Redis SET atomic) -------------------------
-    idemp_key = f"idemp:{idempotency_key}"
-    
-    # Încercăm să scriem cheia cu flag-ul NX (Not eXists) și EX atomic.
-    is_new = await redis_client.set(
-        idemp_key, 
-        "PROCESSING",
-        nx=True,      # Only set if Not eXists
-        ex=30         # Expire în 30 secunde, setat atomic
-    )
-    if not is_new:
-            # Cheia există deja. Verificăm valoarea.
-            cached_val = await redis_client.get(idemp_key)
-            if cached_val == "PROCESSING":
-                logger.warning(
-                    "Cerere concurentă cu aceeași cheie de idempotență",
-                    extra={"event_type": "CONCURRENT_REQUEST_BLOCKED", "terminal_id": terminal_id, "trace_id": idempotency_key}
-                )
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error_code": "CONCURRENT_REQUEST",
-                        "message": "O cerere cu acest idempotency key este deja în procesare",
-                        "retry_after_ms": 2000,
-                        "action_required": "RETRY_LATER"
-                    }
-                )
-            elif cached_val is None:
-                # Cheia a expirat între verificare și citire — tratăm ca nouă cerere
-                logger.warning("Idempotency key expirat între set și get", extra={"event_type": "IDEMP_KEY_EXPIRED", "trace_id": idempotency_key})
-                raise HTTPException(status_code=503, detail={"error_code": "IDEMPOTENCY_STORE_DOWN", "retry_after_ms": 1000})
-            
-            # Altfel înseamnă că tranzacția s-a terminat anterior și avem răspunsul JSON cached.
-            logger.info(
-                "Returnare răspuns din cache (idempotență)",
-                extra={"event_type": "IDEMPOTENT_RESPONSE_RETURNED", "terminal_id": terminal_id, "trace_id": idempotency_key}
+    try:
+        # Blacklist Redis — revocarea operațională (complement la revocarea PKI)
+        is_revoked = await redis_client.sismember("revoked_terminals", terminal_id)
+        if is_revoked:
+            logger.warning(
+                f"Terminal revocat a încercat conexiunea: {terminal_id}",
+                extra={"event_type": "REVOKED_TERMINAL_BLOCKED", "terminal_id": terminal_id}
             )
-            return PaymentResponse(**json.loads(cached_val))
-    
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error_code": "TERMINAL_REVOKED",
+                    "message": "Terminal dezactivat. Contactați suportul.",
+                    "action_required": "CONTACT_SUPPORT"
+                }
+            )
+        
+        # --- PASUL 2: Rate Limiting (Sliding Window Log per terminal) ---
+        # Sliding Window elimină problema Fixed Window (granița secundei).
+        # ZADD + ZREMRANGEBYSCORE + ZCARD = atomic via pipeline.
+        rate_key = f"rate:{terminal_id}"
+        now_ts = time.time()
+        window_start = now_ts - 1.0  # fereastră de 1 secundă
+
+        pipe = redis_client.pipeline()
+        # 1. Șterge cererile mai vechi de 1 secundă
+        pipe.zremrangebyscore(rate_key, 0, window_start)
+        # 2. Adaugă cererea curentă (score = timestamp, member = timestamp ca string)
+        pipe.zadd(rate_key, {str(now_ts): now_ts})
+        # 3. Numără cererile din fereastră
+        pipe.zcard(rate_key)
+        # 4. TTL de curățare
+        pipe.expire(rate_key, 2)
+        _, _, count, _ = await pipe.execute()
+
+        if count > 2:
+            logger.warning(
+                f"Rate limit depășit pentru terminalul {terminal_id}",
+                extra={
+                    "event_type": "RATE_LIMIT_EXCEEDED",
+                    "terminal_id": terminal_id,
+                    "trace_id": idempotency_key
+                }
+            )
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error_code": "RATE_LIMIT_EXCEEDED",
+                    "message": "Prea multe cereri. Maxim 2 cereri pe secundă.",
+                    "retry_after_ms": 1000,
+                    "action_required": "RETRY_LATER"
+                }
+            )
+        
+        # --- PASUL 3: Idempotență (Redis SET atomic) -------------------------
+        idemp_key = f"idemp:{idempotency_key}"
+        
+        # Încercăm să scriem cheia cu flag-ul NX (Not eXists) și EX atomic.
+        is_new = await redis_client.set(
+            idemp_key, 
+            "PROCESSING",
+            nx=True,      # Only set if Not eXists
+            ex=30         # Expire în 30 secunde, setat atomic
+        )
+        if not is_new:
+                # Cheia există deja. Verificăm valoarea.
+                cached_val = await redis_client.get(idemp_key)
+                if cached_val == "PROCESSING":
+                    logger.warning(
+                        "Cerere concurentă cu aceeași cheie de idempotență",
+                        extra={"event_type": "CONCURRENT_REQUEST_BLOCKED", "terminal_id": terminal_id, "trace_id": idempotency_key}
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error_code": "CONCURRENT_REQUEST",
+                            "message": "O cerere cu acest idempotency key este deja în procesare",
+                            "retry_after_ms": 2000,
+                            "action_required": "RETRY_LATER"
+                        }
+                    )
+                elif cached_val is None:
+                    # Cheia a expirat între verificare și citire — tratăm ca nouă cerere
+                    logger.warning("Idempotency key expirat între set și get", extra={"event_type": "IDEMP_KEY_EXPIRED", "trace_id": idempotency_key})
+                    raise HTTPException(status_code=503, detail={"error_code": "IDEMPOTENCY_STORE_DOWN", "retry_after_ms": 1000})
+                
+                # Altfel înseamnă că tranzacția s-a terminat anterior și avem răspunsul JSON cached.
+                logger.info(
+                    "Returnare răspuns din cache (idempotență)",
+                    extra={"event_type": "IDEMPOTENT_RESPONSE_RETURNED", "terminal_id": terminal_id, "trace_id": idempotency_key}
+                )
+                return PaymentResponse(**json.loads(cached_val))
+
+    except HTTPException:
+        raise  # re-ridici excepțiile HTTP — nu le tratezi ca erori Redis
+
+    except Exception as e:
+        logger.error(
+                f"Redis indisponibil: {e}",
+                extra={"event_type": "REDIS_ERROR", "terminal_id": terminal_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "IDEMPOTENCY_STORE_DOWN",
+                "message": "Serviciu temporar indisponibil.",
+                "retry_after_ms": 5000,
+                "action_required": "NONE"
+            }
+        )
     
     # --- PASUL 4: Rutare către TSP ------------------------------
     logger.info(
@@ -670,8 +688,25 @@ async def authorize_payment(
     # DECLINED se cachează 30 min (nu 24h) — permite retry după Risk Decay
     # APPROVED se cachează 24h pentru idempotență completă
     cache_ttl = 1800 if bank_status == "DECLINED" else 86400
-    await redis_client.setex(idemp_key, cache_ttl, final_response.model_dump_json())
-
+    
+    # --- FAIL-CLOSED: Validare Redis ---
+    # Dacă Redis e jos, respingem raspunsul final
+    try:
+        await redis_client.setex(idemp_key, cache_ttl, final_response.model_dump_json())
+    except Exception as e:
+        logger.error(
+            f"Redis indisponibil: {e}",
+            extra={"event_type": "REDIS_ERROR", "terminal_id": terminal_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "IDEMPOTENCY_STORE_DOWN",
+                "message": "Serviciu temporar indisponibil.",
+                "retry_after_ms": 5000,
+                "action_required": "NONE"
+            }
+        )
     return final_response
 
 # --- PORNIRE ---
