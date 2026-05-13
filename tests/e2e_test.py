@@ -187,7 +187,7 @@ def main():
     # ATC-uri bazate pe timestamp Unix — garantat crescătoare între rulări succesive.
     # Redis persistă ATC-urile (AOF), deci rularea 2 cu aceiași ATC statici (100, 200)
     # ar fi respinsă ca replay. time.time() crește la fiecare rulare → ATC nou, valid.
-    _atc_base = int(time.time())
+    _atc_base = int(time.time() * 1000)
     tc01_atc  = _atc_base        # folosit și în TC-05 (replay)
     atc2      = _atc_base + 1
     atc3      = _atc_base + 2
