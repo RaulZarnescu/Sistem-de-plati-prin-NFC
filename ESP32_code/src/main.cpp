@@ -5,7 +5,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <LiquidCrystal_I2C.h>
+#include <TFT_eSPI.h>
 #include <Keypad.h>
 #include <time.h>
 
@@ -22,10 +22,6 @@
 #define PN532_MISO (19)
 #define PN532_MOSI (23)
 #define PN532_SS   (5)
-
-// I2C LCD (Standard ESP32 I2C Pins)
-#define SDA_PIN 21
-#define SCL_PIN 22
 
 // ----- Keypad Rows (Output) -----
 #define KEYPAD_R1  (13)
@@ -54,7 +50,7 @@ byte colPins[COLS] = {KEYPAD_C1, KEYPAD_C2, KEYPAD_C3, KEYPAD_C4};
 // ----- Object Initializations -----
 Adafruit_PN532 nfc(PN532_SS);
 WiFiClientSecure secureClient;
-LiquidCrystal_I2C lcd(0x27, 16, 2); 
+TFT_eSPI tft = TFT_eSPI();
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
 // ---- Project Configuration -----
@@ -63,7 +59,6 @@ const char* password = "your_wifi_password";
 const char* gateway_url = "https://your-backend-ip/api/v1/payments/authorize";
 const char* terminal_id = "POS-001";
 
-// ----- 1. Registry Setup (Bare-Metal GPIO) -------
 void setup_registru_hardware() {
   PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[5], PIN_FUNC_GPIO);
   GPIO.enable_w1ts = PN532_SS_BIT; 
@@ -80,7 +75,18 @@ String getIsoTimestamp() {
   return String(buf);
 }
 
-// ----- 3. Networking: Exponential Backoff (Cap 7.0) -------
+void showMessage(const char* line1, const char* line2 = nullptr) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(0, 0);
+  tft.print(line1);
+  if (line2) {
+    tft.setCursor(0, 40);
+    tft.print(line2);
+  }
+}
+
 void sendRequestWithBackoff(String payload, String idempotencyKey) {
   int max_retries = 3;
   int base_delay = 1000;
@@ -94,46 +100,44 @@ void sendRequestWithBackoff(String payload, String idempotencyKey) {
 
     int httpCode = http.POST(payload);
     if (httpCode == 200) {
-      lcd.setCursor(0, 1);
-      lcd.print("Approved!       ");
+      showMessage("Approved!", nullptr);
       http.end();
       return;
     } else {
       int wait = random(0, base_delay * (1 << i));
-      lcd.setCursor(0, 1);
-      lcd.print("Retry in "); lcd.print(wait / 1000); lcd.print("s");
+      char buf[32];
+      snprintf(buf, sizeof(buf), "Retry in %ds", wait / 1000);
+      showMessage("Network error", buf);
       delay(wait);
     }
     http.end();
   }
-  lcd.clear();
-  lcd.print("System Error");
+  showMessage("System Error", nullptr);
 }
 
 void setup() {
   Serial.begin(115200);
-  
   setup_registru_hardware();
 
-  lcd.init();
-  lcd.backlight();
-  lcd.print("Connecting...");
+  tft.init();
+  tft.setRotation(1);
+  showMessage("Connecting...", nullptr);
 
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) delay(500);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
 
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   secureClient.setInsecure(); // development only
 
-  lcd.clear();
-  lcd.print("WiFi Online");
-  
+  showMessage("WiFi Online", nullptr);
+
   nfc.begin();
   nfc.SAMConfig();
-  
+
   delay(1000);
-  lcd.clear();
-  lcd.print("Scan Phone/Card");
+  showMessage("Scan Phone/Card", nullptr);
 }
 
 void loop() {
@@ -149,8 +153,7 @@ void loop() {
   success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
   
   if (success) {
-    lcd.clear();
-    lcd.print("Card Found");
+    showMessage("Card Found", nullptr);
     
     uint8_t selectApp[] = {0x00, 0xA4, 0x04, 0x00, 0x07, 0xF1, 0xC7, 0x1B, 0x3B, 0x4E, 0x4B, 0x01};
     uint8_t response[255];
@@ -204,28 +207,21 @@ void loop() {
           sendRequestWithBackoff(json, uuid);
 
           delay(3000);
-          lcd.clear();
-          lcd.print("Scan Phone/Card");
+          showMessage("Scan Phone/Card", nullptr);
         } else {
-          lcd.setCursor(0, 1);
-          lcd.print("HCE Parse Err");
+          showMessage("HCE Parse Err", nullptr);
           delay(1000);
-          lcd.clear();
-          lcd.print("Scan Phone/Card");
+          showMessage("Scan Phone/Card", nullptr);
         }
       } else {
-        lcd.setCursor(0, 1);
-        lcd.print("HCE Fail");
+        showMessage("HCE Fail", nullptr);
         delay(1000);
-        lcd.clear();
-        lcd.print("Scan Phone/Card");
+        showMessage("Scan Phone/Card", nullptr);
       }
     } else {
-      lcd.setCursor(0, 1);
-      lcd.print("Select Fail");
+      showMessage("Select Fail", nullptr);
       delay(1000);
-      lcd.clear();
-      lcd.print("Scan Phone/Card");
+      showMessage("Scan Phone/Card", nullptr);
     }
   }
   delay(200); 

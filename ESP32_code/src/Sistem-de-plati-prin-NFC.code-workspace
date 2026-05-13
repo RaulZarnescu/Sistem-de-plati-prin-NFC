@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../Android"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../services"
+		}
+	],
+	"settings": {}
+}
