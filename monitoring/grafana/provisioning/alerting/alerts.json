@@ -1,0 +1,262 @@
+{
+  "apiVersion": 1,
+  "groups": [
+    {
+      "orgId": 1,
+      "name": "Main",
+      "folder": "Alerts",
+      "interval": "1m",
+      "rules": [
+        {
+          "id": 1,
+          "uid": "fflxz3333dypsa",
+          "orgID": 1,
+          "folderUID": "bflxz1mhed5oge",
+          "ruleGroup": "BRUTE_FORCE",
+          "title": "CRYPTO_BRUTE_FORCE_DETECTED",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "queryType": "",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "eflxnh32mbif4e",
+              "model": {
+                "editorMode": "builder",
+                "expr": "sum(rate(http_requests_total{job=\"issuing-bank\", status=\"4xx\"}[1m])) * 60",
+                "instant": true,
+                "intervalMs": 1000,
+                "legendFormat": "__auto",
+                "maxDataPoints": 43200,
+                "range": false,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "queryType": "expression",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        10
+                      ],
+                      "type": "gt"
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "params": [],
+                      "type": "last"
+                    },
+                    "type": "query"
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "updated": "2026-05-13T14:15:25Z",
+          "noDataState": "NoData",
+          "execErrState": "Error",
+          "for": "1m",
+          "keep_firing_for": "0s",
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "empty"
+          },
+          "record": null
+        },
+        {
+          "id": 3,
+          "uid": "dflxzmhcc2nlsc",
+          "orgID": 1,
+          "folderUID": "bflxz1mhed5oge",
+          "ruleGroup": "ERROR_RATE",
+          "title": "ERROR_RATE_5XX_EXCEEDED",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "queryType": "",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "eflxnh32mbif4e",
+              "model": {
+                "editorMode": "builder",
+                "expr": "sum(rate(http_requests_total{job=\"payment-gateway\", status=~\"5xx\"}[1m])) / (rate(http_requests_total{job=\"payment-gateway\"}[1m]) * 100)",
+                "instant": true,
+                "intervalMs": 1000,
+                "legendFormat": "__auto",
+                "maxDataPoints": 43200,
+                "range": false,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "queryType": "expression",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        1
+                      ],
+                      "type": "gt"
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "params": [],
+                      "type": "last"
+                    },
+                    "type": "query"
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "updated": "2026-05-13T15:07:58Z",
+          "noDataState": "NoData",
+          "execErrState": "Error",
+          "for": "5m",
+          "keep_firing_for": "0s",
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "empty"
+          },
+          "record": null
+        },
+        {
+          "id": 2,
+          "uid": "bflxz8sxyn20wa",
+          "orgID": 1,
+          "folderUID": "bflxz1mhed5oge",
+          "ruleGroup": "SLA_BREACH",
+          "title": "SLA_BREACH_P95",
+          "condition": "A",
+          "data": [
+            {
+              "refId": "A",
+              "queryType": "",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "eflxnh32mbif4e",
+              "model": {
+                "editorMode": "code",
+                "expr": "histogram_quantile(0.95, sum by (le) (\r\n    rate(http_request_duration_seconds_bucket{\r\n        job=\"payment-gateway\",\r\n        handler=\"/api/v1/payments/authorize\"\r\n    }[1m])\r\n)) \r\nand \r\nsum(rate(http_requests_total{job=\"payment-gateway\"}[1m])) > 0\r\n",
+                "instant": true,
+                "intervalMs": 1000,
+                "legendFormat": "__auto",
+                "maxDataPoints": 43200,
+                "range": false,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "B",
+              "queryType": "",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        1.5,
+                        0
+                      ],
+                      "type": "gt"
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": []
+                    },
+                    "reducer": {
+                      "params": [],
+                      "type": "avg"
+                    },
+                    "type": "query"
+                  }
+                ],
+                "datasource": {
+                  "name": "Expression",
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "B",
+                "type": "threshold"
+              }
+            }
+          ],
+          "updated": "2026-05-13T15:29:15Z",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "3m",
+          "keep_firing_for": "0s",
+          "isPaused": false,
+          "notification_settings": {
+            "receiver": "empty"
+          },
+          "record": null
+        }
+      ]
+    }
+  ]
+}
