@@ -1,9 +1,9 @@
 package com.example.sistemplatanfc.hce
 
-import android.content.Context
 import android.nfc.cardemulation.HostApduService
 import android.os.Bundle
 import android.util.Log
+import androidx.core.content.edit
 import com.example.sistemplatanfc.data.CardManager
 import com.example.sistemplatanfc.utils.CryptoUtils
 import java.nio.charset.StandardCharsets
@@ -15,10 +15,10 @@ class PaymentHceService : HostApduService() {
     // la fiecare restart al serviciului HCE — permitea Replay Attacks după restart.
     // SharedPreferences supraviețuiește repornirii serviciului și a aplicației.
     private var atc: Int
-        get() = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        get() = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .getInt(KEY_ATC, 0)
-        set(value) = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putInt(KEY_ATC, value).apply()
+        set(value) = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .edit { putInt(KEY_ATC, value) }
 
     override fun processCommandApdu(commandApdu: ByteArray?, extras: Bundle?): ByteArray {
         if (commandApdu == null) return STATUS_FAILED
@@ -63,7 +63,7 @@ class PaymentHceService : HostApduService() {
                 return STATUS_FAILED
             }
             val lc = commandApdu[4].toInt() and 0xFF
-            if (commandApdu.size < 5 + lc) {
+            if (commandApdu.size < (5 + lc)) {
                 Log.e("HCE", "APDU trunchiat: declarat Lc=$lc, primit ${commandApdu.size - 5} bytes")
                 return STATUS_FAILED
             }
@@ -92,7 +92,7 @@ class PaymentHceService : HostApduService() {
                 currency          = currency,
                 posNonce          = nonce,
                 terminalTimestamp = timestamp,
-                atc               = newAtc
+                atc               = newAtc,
             )
 
             Log.i("HCE", "Plată semnată: DPAN=${activeCard.dpan} ATC=$newAtc")
