@@ -38,3 +38,9 @@ httpx==0.27.0
 # Necesare pentru a exporta metrici în format Prometheus (/metrics)
 # și pentru a expune endpoint-ul /health corespunzător specificațiilor
 prometheus-fastapi-instrumentator==6.1.0
+
+# Driver PostgreSQL asincron necesar pentru a conecta la baza de date
+asyncpg
+
+# Librărie pentru operații criptografice (semnături HMAC)
+cryptography

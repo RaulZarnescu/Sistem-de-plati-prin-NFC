@@ -1,0 +1,43 @@
+CREATE TABLE IF NOT EXISTS accounts (
+    pan         VARCHAR(19)  PRIMARY KEY,
+    balance     INTEGER      NOT NULL DEFAULT 100000 CHECK (balance >= 0),  -- Nu se permite sold negativ
+    last_atc    BIGINT       NOT NULL DEFAULT -1,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id              SERIAL       PRIMARY KEY,
+    transaction_id  VARCHAR(32)  UNIQUE NOT NULL,
+    pan             VARCHAR(19)  NOT NULL REFERENCES accounts(pan),
+    amount          INTEGER      NOT NULL CHECK (amount >= 0),
+    currency        VARCHAR(3)   NOT NULL,
+    status          VARCHAR(20)  NOT NULL,
+    risk_score      INTEGER,
+    terminal_id     VARCHAR(50),
+    bank            VARCHAR(10)  NOT NULL DEFAULT 'UNKNOWN',
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_pan ON transactions(pan);
+CREATE INDEX IF NOT EXISTS idx_transactions_created ON transactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_terminal ON transactions(terminal_id);
+
+-- Crearea trigger-ului pentru imutabilitate (Ledger Pattern)
+CREATE OR REPLACE FUNCTION prevent_update_delete() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'Updates and deletes are not allowed on the transactions table for compliance reasons.';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS make_transactions_immutable ON transactions;
+CREATE TRIGGER make_transactions_immutable
+BEFORE UPDATE OR DELETE ON transactions
+FOR EACH ROW EXECUTE FUNCTION prevent_update_delete();
+
+-- Seed accounts pentru DPANs existente
+INSERT INTO accounts (pan, balance) VALUES
+    ('4000001111111111', 100000),
+    ('5000002222222222', 100000),
+    ('5111113333333333', 100000),
+    ('4222222222222222', 100000)
+ON CONFLICT (pan) DO NOTHING;

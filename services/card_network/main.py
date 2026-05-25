@@ -59,12 +59,20 @@ if not logger.handlers:
 
 # --- ROUTING TABLE ---
 # IIN prefix → URL-ul băncii emitente corespunzătoare
-# În producție: tabel în bază de date, actualizat de Visa/Mastercard
 ROUTING_TABLE = {
-    "400000": os.getenv("ISSUING_BANK_A_URL", "http://issuing-bank:8004"),
-    "500000": os.getenv("ISSUING_BANK_B_URL", "http://issuing-bank-b:8006"),
-    "4":      os.getenv("ISSUING_BANK_A_URL", "http://issuing-bank:8004"),
-    "5":      os.getenv("ISSUING_BANK_B_URL", "http://issuing-bank-b:8006"),
+    # Banca Transilvania (Visa)
+    "400000": os.getenv("ISSUING_BANK_BT_URL", "http://issuing-bank-bt:8004"),
+    "422222": os.getenv("ISSUING_BANK_BT_URL", "http://issuing-bank-bt:8004"),
+    
+    # BCR (Mastercard)
+    "500000": os.getenv("ISSUING_BANK_BCR_URL", "http://issuing-bank-bcr:8006"),
+    
+    # ING Bank (Mastercard)
+    "511111": os.getenv("ISSUING_BANK_ING_URL", "http://issuing-bank-ing:8007"),
+    
+    # Fallbacks (for testing)
+    "4": os.getenv("ISSUING_BANK_BT_URL", "http://issuing-bank-bt:8004"),
+    "5": os.getenv("ISSUING_BANK_BCR_URL", "http://issuing-bank-bcr:8006"), # Implicit ducem Mastercard la BCR
 }
 
 AUTHORIZE_PATH = "/api/v1/transactions/authorize"
@@ -103,6 +111,12 @@ class CardNetworkRequest(BaseModel):
     idempotency_key: str
     terminal_id: str
 
+class ChallengeRouteRequest(BaseModel):
+    pan: str
+    transaction_id: str
+    idempotency_key: str
+    terminal_id: str
+    pin_block_encrypted: str
 
 # --- LIFESPAN ---
 
@@ -133,6 +147,33 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+
+@app.post("/api/v1/challenge/route")
+async def route_challenge(payload: ChallengeRouteRequest):
+    bank_base_url = find_bank_url(payload.pan, ROUTING_TABLE)
+    if not bank_base_url:
+        raise HTTPException(400, {"error_code": "UNSUPPORTED_CARD_NETWORK"})
+
+    try:
+        async with httpx.AsyncClient(timeout=1.2) as client:
+            response = await client.post(
+                f"{bank_base_url}/api/v1/payments/challenge",
+                json={
+                    "transaction_id": payload.transaction_id,
+                    "idempotency_key": payload.idempotency_key,
+                    "terminal_id": payload.terminal_id,
+                    "pin_block_encrypted": payload.pin_block_encrypted
+                }
+            )
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=response.json().get("detail", {})
+            )
+
+        return response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(503, {"error_code": "BANK_TIMEOUT"})
 
 @app.post("/api/v1/transactions/route")
 async def route_transaction(payload: CardNetworkRequest):

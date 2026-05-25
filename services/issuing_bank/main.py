@@ -7,6 +7,7 @@
 #   3. Autorizează sau respinge tranzacția.
 # ============================================================
 
+
 import sys
 sys.path.append("/app")
 
@@ -25,9 +26,16 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 # pyrefly: ignore [missing-import]
 import redis.asyncio as aioredis
+import asyncpg
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+import base64
+
+BANK_PRIVATE_KEY = None
 
 redis_client: Optional[aioredis.Redis] = None
-
+db_pool: Optional[asyncpg.Pool] = None
 
 from shared.crypto_utils import verify_mac
 
@@ -38,6 +46,8 @@ try:
     HMAC_KEY = bytes.fromhex(_key_hex) if _key_hex else b""
 except ValueError:
     HMAC_KEY = b""
+
+BANK_ID = os.getenv("BANK_ID", "UNKNOWN")
 
 # --- CONFIGURAREA LOG-URILOR CU MASCARE PII ---
 
@@ -79,6 +89,11 @@ class MaskedJSONFormatter(logging.Formatter):
         if hasattr(record, "trace_id"):
             log_entry["trace_id"] = record.trace_id
             
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+            
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
         return json.dumps(log_entry, ensure_ascii=False)
 
 
@@ -129,9 +144,10 @@ class IssuingBankResponse(BaseModel):
 
 # --- APLICAȚIA FASTAPI ---
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client
+    global redis_client, db_pool, BANK_PRIVATE_KEY
 
     for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
         u_logger = logging.getLogger(logger_name)
@@ -160,10 +176,35 @@ async def lifespan(app: FastAPI):
             extra={"event_type": "REDIS_ERROR"}
         )
 
+    try:
+        db_pool = await asyncpg.create_pool(
+            host=os.getenv("POSTGRES_BANK_HOST", "postgres-bank"),
+            port=int(os.getenv("POSTGRES_BANK_PORT", 5432)),
+            database=os.getenv("POSTGRES_BANK_DB", "bank_db"),
+            user=os.getenv("POSTGRES_BANK_USER", "bank_user"),
+            password=os.getenv("POSTGRES_BANK_PASSWORD", "bank_secret"),
+            min_size=2,
+            max_size=10
+        )
+        logger.info("Conexiune PostgreSQL stabilită", extra={"event_type": "DB_CONNECTED"})
+    except Exception as e:
+        logger.error(f"PostgreSQL indisponibil: {e}", extra={"event_type": "DB_ERROR"})
+
+    try:
+        with open("/app/certs/bank_private.pem", "rb") as f:
+            BANK_PRIVATE_KEY = serialization.load_pem_private_key(f.read(), password=None)
+        logger.info("Cheie privată RSA încărcată", extra={"event_type": "RSA_KEY_LOADED"})
+    except Exception as e:
+        logger.error(f"Cheie privată RSA lipsă: {e}", extra={"event_type": "RSA_KEY_ERROR"})
+
+
+    logger.info("Issuing Bank pornit", extra={"event_type": "SERVICE_STARTUP"})
     yield
 
     if redis_client:
         await redis_client.aclose()
+    if db_pool:
+        await db_pool.close()
 
 app = FastAPI(title="NFC Issuing Bank", version="1.0.0", lifespan=lifespan)
 
@@ -171,6 +212,12 @@ app = FastAPI(title="NFC Issuing Bank", version="1.0.0", lifespan=lifespan)
 from prometheus_fastapi_instrumentator import Instrumentator
 
 Instrumentator().instrument(app).expose(app)
+
+class ChallengeRequest(BaseModel):
+    transaction_id: str = Field(..., description="ID-ul tranzacției originale")
+    idempotency_key: str = Field(..., description="Cheie nouă de idempotență pentru challenge")
+    terminal_id: str = Field(..., description="ID-ul terminalului POS")
+    pin_block_encrypted: str = Field(..., description="PIN Block criptat RSA-OAEP, encodat Base64")
 
 
 
@@ -182,6 +229,117 @@ async def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+
+@app.post("/api/v1/payments/challenge")
+async def challenge_payment(payload: ChallengeRequest):
+    trace_id = payload.idempotency_key
+
+    logger.info(
+        f"Challenge primit pentru tranzacția: {payload.transaction_id}",
+        extra={"event_type": "CHALLENGE_RECEIVED", "trace_id": trace_id}
+    )
+
+    if not BANK_PRIVATE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "SERVICE_UNAVAILABLE",
+                    "message": "Cheie RSA indisponibilă"}
+        )
+
+    # Decriptare PIN Block
+    try:
+        encrypted_bytes = base64.b64decode(payload.pin_block_encrypted)
+        pin_block = BANK_PRIVATE_KEY.decrypt(
+            encrypted_bytes,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+    except Exception as e:
+        logger.error(
+            "Decriptare PIN Block eșuată.",
+            extra={"event_type": "PIN_DECRYPT_FAILED", "trace_id": trace_id}
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "INVALID_PIN_BLOCK",
+                "message": "PIN Block invalid sau corupt.",
+                "action_required": "RETRY_WITH_PIN"
+            }
+        )
+
+    # Verificare anti-replay — transaction_id din PIN Block
+    # ISO 9564 Format 4: PIN Block conține transaction_id în payload intern
+    # PoC: verificăm că transaction_id din request e prezent în PIN Block decriptat
+    pin_block_str = pin_block.decode("utf-8", errors="ignore")
+    if payload.transaction_id not in pin_block_str:
+        logger.error(
+            "PIN Block nu conține transaction_id corect — posibil replay.",
+            extra={"event_type": "PIN_REPLAY_DETECTED", "trace_id": trace_id}
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "INVALID_PIN_BLOCK",
+                "message": "PIN Block invalid.",
+                "action_required": "DECLINE_TRANSACTION"
+            }
+        )
+
+    # PIN extras — în PoC acceptăm orice PIN valid (4-6 cifre)
+    # Producție: comparare cu PIN hash stocat în HSM
+    pin = "".join(filter(str.isdigit, pin_block_str))[:6]
+
+    if len(pin) < 4:
+        logger.warning(
+            "PIN invalid — lungime incorectă.",
+            extra={"event_type": "PIN_INVALID", "trace_id": trace_id}
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "INVALID_PIN",
+                "message": "PIN invalid.",
+                "action_required": "RETRY_WITH_PIN"
+            }
+        )
+
+    logger.info(
+        f"PIN validat cu succes pentru tranzacția {payload.transaction_id}.",
+        extra={"event_type": "PIN_VALIDATED", "trace_id": trace_id}
+    )
+
+    # Tranzacția Step-Up e aprobată
+    transaction_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+    now = datetime.now(timezone.utc)
+
+    # Salvare în PostgreSQL
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("""
+                        INSERT INTO transactions
+                            (transaction_id, pan, amount, currency,
+                             status, risk_score, terminal_id, bank, created_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    """,
+                        transaction_id, "STEP-UP", 0, "RON",
+                        "APPROVED", 0, payload.terminal_id, BANK_ID, now
+                    )
+        except Exception as e:
+            logger.error(f"Eroare scriere challenge în DB: {e}",
+                        extra={"event_type": "DB_ERROR", "trace_id": trace_id})
+
+    return {
+        "status": "APPROVED",
+        "transaction_id": transaction_id,
+        "auth_code": uuid.uuid4().hex[:8].upper(),
+        "processed_at": now.isoformat()
+    }
 
 @app.post("/api/v1/transactions/authorize", response_model=IssuingBankResponse)
 async def authorize_transaction(payload: IssuingBankRequest):
@@ -239,39 +397,6 @@ async def authorize_transaction(payload: IssuingBankRequest):
                 "action_required": "RETRY_LATER"
             }
         )
-
-    # --- VALIDARE ATC (Anti-Replay, Cap. 7.6) ---
-    received_atc = payload.cryptogram.atc
-    atc_key = f"atc:{payload.pan}"
-
-    # GET → verificăm ÎNAINTE de a scrie în Redis.
-    # GETSET (varianta anterioară) scria valoarea ÎNAINTE de check — bug:
-    # un ATC de replay suprascria valoarea legitimă din Redis.
-    # Producție: înlocuiți cu script Lua pentru atomicitate completă la concurență.
-    old_atc_raw = await redis_client.get(atc_key)
-    stored_atc = int(old_atc_raw) if old_atc_raw is not None else -1
-
-    if received_atc <= stored_atc:
-        logger.error(
-            f"ATC invalid: primit {received_atc}, stocat {stored_atc}. Posibil Replay Attack.",
-            extra={"event_type": "REPLAY_ATTACK_DETECTED", "trace_id": trace_id}
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error_code": "INVALID_CRYPTOGRAM",
-                "message": "ATC invalid. Tranzacție refuzată.",
-                "action_required": "DECLINE_TRANSACTION"
-            }
-        )
-
-    # ATC valid — scriem în Redis DUPĂ validare
-    await redis_client.set(atc_key, received_atc, ex=86400 * 30)  # TTL 30 zile
-    
-    logger.info(
-        f"ATC valid. Primit: {received_atc}, anterior: {stored_atc}.",
-        extra={"event_type": "ATC_VALIDATED", "trace_id": trace_id}
-    )
 
     # --- FRAUD ENGINE COMPLET (Cap. 6.1, 6.2, 6.3) ---
     tsp_risk = payload.risk_level
@@ -392,12 +517,155 @@ async def authorize_transaction(payload: IssuingBankRequest):
             extra={"event_type": "LEDGER_UPDATED", "trace_id": trace_id}
         )
 
-    # APPROVED și DECLINED returnează HTTP 200 — decizia bancară e business logic, nu eroare tehnică.
-    # CHALLENGE_REQUIRED ridică excepție HTTP 401 (spec Cap. 6.2).
+    
+    # --- VALIDARE ATC, SOLD SI SALVARE TRANZACTIE ---
+    received_atc = payload.cryptogram.atc
+
+    if not db_pool:
+        logger.error("PostgreSQL indisponibil.", extra={"event_type": "DB_ERROR", "trace_id": trace_id})
+        raise HTTPException(status_code=503, detail={"error_code": "SERVICE_UNAVAILABLE"})
+
+    txn_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            account = await conn.fetchrow(
+                "SELECT pan, balance, last_atc FROM accounts WHERE pan = $1 FOR UPDATE",
+                payload.pan
+            )
+
+            if not account:
+                await conn.execute(
+                    "INSERT INTO accounts (pan, balance, last_atc) VALUES ($1, 100000, -1)",
+                    payload.pan
+                )
+                stored_atc = -1
+                current_balance = 100000
+            else:
+                stored_atc = account["last_atc"]
+                current_balance = account["balance"]
+
+            # Validare ATC
+            if received_atc <= stored_atc:
+                logger.error(
+                    f"ATC invalid: primit {received_atc}, stocat {stored_atc}.",
+                    extra={"event_type": "REPLAY_ATTACK_DETECTED", "trace_id": trace_id}
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error_code": "INVALID_CRYPTOGRAM",
+                        "message": "ATC invalid. Tranzacție refuzată.",
+                        "action_required": "DECLINE_TRANSACTION"
+                    }
+                )
+
+            logger.info(
+                f"ATC valid. Primit: {received_atc}, anterior: {stored_atc}.",
+                extra={"event_type": "ATC_VALIDATED", "trace_id": trace_id}
+            )
+
+            # Verificare sold suficient
+            if status != "DECLINED" and current_balance < payload.transaction.amount:
+                logger.warning(
+                    f"Sold insuficient. Disponibil: {current_balance}, cerut: {payload.transaction.amount}",
+                    extra={"event_type": "INSUFFICIENT_FUNDS", "trace_id": trace_id}
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error_code": "INSUFFICIENT_FUNDS",
+                        "message": "Sold insuficient.",
+                        "action_required": "DECLINE_TRANSACTION"
+                    }
+                )
+
+            # Deducere sold dacă APPROVED
+            if status == "APPROVED":
+                await conn.execute(
+                    "UPDATE accounts SET balance = balance - $1, last_atc = $2 WHERE pan = $3",
+                    payload.transaction.amount, received_atc, payload.pan
+                )
+            else:
+                await conn.execute(
+                    "UPDATE accounts SET last_atc = $1 WHERE pan = $2",
+                    received_atc, payload.pan
+                )
+
+            # Inserare tranzactie
+            await conn.execute("""
+                INSERT INTO transactions
+                    (transaction_id, pan, amount, currency, status,
+                    risk_score, terminal_id, bank, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """,
+                txn_id, payload.pan, payload.transaction.amount,
+                payload.transaction.currency, status,
+                final_risk, payload.terminal_id, BANK_ID, now
+            )
+
     return IssuingBankResponse(
         status=status,
-        transaction_id=f"TXN-{uuid.uuid4().hex[:12].upper()}",
+        transaction_id=txn_id,
         auth_code=auth_code,
         risk_score=final_risk,
         processed_at=now.isoformat()
-    )
+)
+
+# --- ENDPOINT-URI ADMIN (Dashboard) ---
+
+@app.get("/api/v1/admin/transactions")
+async def get_transactions():
+    if not db_pool:
+        return {"transactions": []}
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT transaction_id, pan, amount, currency, status,
+                   risk_score, terminal_id, bank, created_at
+            FROM transactions
+            ORDER BY created_at DESC
+            LIMIT 100
+        """)
+    return {"transactions": [
+        {
+            "transaction_id": r["transaction_id"],
+            "pan_masked": f"{r['pan'][:4]}********{r['pan'][-4:]}",
+            "amount": r["amount"],
+            "currency": r["currency"],
+            "status": r["status"],
+            "risk_score": r["risk_score"],
+            "terminal_id": r["terminal_id"],
+            "bank": r["bank"],
+            "timestamp": r["created_at"].isoformat()
+        }
+        for r in rows
+    ]}
+
+
+@app.get("/api/v1/admin/risk-profiles")
+async def get_risk_profiles():
+    if not redis_client:
+        return {"profiles": []}
+    profiles = []
+    try:
+        keys = await redis_client.keys("risk:*")
+        for key in keys:
+            data = await redis_client.hgetall(key)
+            if data:
+                pan = key.replace("risk:", "")
+                score = float(data.get("score", 0))
+                profiles.append({
+                    "pan_masked": f"{pan[:4]}********{pan[-4:]}",
+                    "current_score": round(score, 2),
+                    "last_transaction": data.get("timestamp", "N/A"),
+                    "risk_level": "HIGH" if score > 75 else "MEDIUM" if score > 40 else "LOW"
+                })
+    except Exception as e:
+        logger.error(f"Eroare citire risk profiles: {e}")
+    return {"profiles": profiles}
+
+# --- PORNIRE ---
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("ISSUING_BANK_PORT", 8004)), reload=True)

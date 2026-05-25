@@ -32,6 +32,8 @@ from datetime import datetime
 from typing import Optional
 
 redis_client: Optional[aioredis.Redis] = None
+CA_CERT = None  # x509.Certificate încărcat la startup
+CA_KEY = None   # cheie privată CA — NICIODATĂ logată
 
 # Pydantic — pentru definirea structurii datelor așteptate
 # BaseModel = clasa de bază pentru orice "model" de date
@@ -48,11 +50,15 @@ import logging
 # json — pentru a formata log-urile ca JSON (Structured Logging din spec)
 import json
 import re
+import base64
 # pyright: ignore [reportMissingImports]
 import httpx
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
 
 # datetime — pentru timestamp-uri în log-uri
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # dotenv — citește automat fișierul .env și populează os.environ
 # pyright: ignore [reportMissingImports]
@@ -126,7 +132,7 @@ if not logger.handlers:
 # --- EVENT HANDLERS -----------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client
+    global redis_client, CA_CERT, CA_KEY
     
     # Suprascriem logger-ele implicite din uvicorn pentru a folosi formatul JSON
     for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
@@ -145,6 +151,15 @@ async def lifespan(app: FastAPI):
         logger.info("Conexiune Redis stabilită", extra={"event_type": "REDIS_CONNECTED"})
     except Exception as e:
         logger.error(f"Redis indisponibil la startup: {e}", extra={"event_type": "REDIS_ERROR"})
+
+    try:
+        with open("/app/certs/ca.crt", "rb") as f:
+            CA_CERT = x509.load_pem_x509_certificate(f.read())
+        with open("/app/certs/ca.key", "rb") as f:
+            CA_KEY = serialization.load_pem_private_key(f.read(), password=None)
+        logger.info("CA încărcat", extra={"event_type": "CA_LOADED"})
+    except Exception as e:
+        logger.error(f"CA indisponibil: {e}", extra={"event_type": "CA_ERROR"})
 
     logger.info(
         "Payment Gateway pornit",
@@ -249,7 +264,13 @@ class PaymentResponse(BaseModel):
     risk_score: Optional[int] = Field(None, description="Scorul de risc calculat (0-100)")
     processed_at: Optional[str] = Field(None, description="Timestamp procesare")
 
+class ChallengePaymentRequest(BaseModel):
+    transaction_id: str
+    original_dpan: str  # pentru a determina banca
+    pin_block_encrypted: str
 
+class PKIRenewRequest(BaseModel):
+    csr_pem_b64: str
 
 # --- ENDPOINT-URI -------------------------------------------
 # Un "endpoint" = o adresă URL la care serviciul nostru răspunde
@@ -281,6 +302,51 @@ async def health_check():
         "version": "1.0.0"
     }
 
+
+@app.post("/api/v1/payments/challenge")
+async def challenge_payment(
+    request: Request,
+    payload: ChallengePaymentRequest,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_terminal_id: Optional[str] = Header(None, alias="X-Terminal-Id")
+):
+    idempotency_key = x_idempotency_key
+    terminal_id = x_terminal_id
+
+    if not idempotency_key:
+        raise HTTPException(400, {"error_code": "MISSING_IDEMPOTENCY_KEY"})
+    if not terminal_id:
+        raise HTTPException(400, {"error_code": "MISSING_TERMINAL_ID"})
+
+    # Detokenizare pentru a afla banca
+    try:
+        async with httpx.AsyncClient(timeout=0.3) as client:
+            tsp_response = await client.post(
+                "http://tsp:8002/api/v1/tokens/detokenize",
+                json={"dpan": payload.original_dpan, "trace_id": idempotency_key}
+            )
+        if tsp_response.status_code != 200:
+            raise HTTPException(400, {"error_code": "INVALID_TOKEN"})
+        pan = tsp_response.json().get("pan")
+    except httpx.TimeoutException:
+        raise HTTPException(503, {"error_code": "TSP_TIMEOUT"})
+
+    # Rutare către banca corectă via Card Network
+    try:
+        async with httpx.AsyncClient(timeout=1.2) as client:
+            bank_response = await client.post(
+                "http://card-network:8003/api/v1/challenge/route",
+                json={
+                    "pan": pan,
+                    "transaction_id": payload.transaction_id,
+                    "idempotency_key": idempotency_key,
+                    "terminal_id": terminal_id,
+                    "pin_block_encrypted": payload.pin_block_encrypted
+                }
+            )
+        return bank_response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(503, {"error_code": "BANK_TIMEOUT"})
 
 @app.post("/api/v1/payments/authorize", response_model=PaymentResponse)
 async def authorize_payment(
@@ -708,6 +774,105 @@ async def authorize_payment(
             }
         )
     return final_response
+
+@app.post("/api/pki/renew")
+async def renew_certificate(
+    request: Request,
+    payload: PKIRenewRequest,
+    x_terminal_id: Optional[str] = Header(None, alias="X-Terminal-Id")
+):
+    """
+    Reînnoiește certificatul mTLS al unui terminal POS.
+    Accesat EXCLUSIV prin NGINX (mTLS obligatoriu — ssl_verify_client on).
+    PoC: nu verificăm data expirării certificatului curent.
+    """
+    terminal_id = x_terminal_id or "UNKNOWN"
+
+    logger.info(
+        f"Cerere reînnoire certificat de la terminal {terminal_id}",
+        extra={"event_type": "PKI_RENEWAL_REQUEST", "terminal_id": terminal_id}
+    )
+
+    if CA_CERT is None or CA_KEY is None:
+        logger.error(
+            "CA indisponibil — nu se poate semna certificatul",
+            extra={"event_type": "PKI_RENEWAL_FAILED", "terminal_id": terminal_id, "reason": "CA_UNAVAILABLE"}
+        )
+        raise HTTPException(status_code=503, detail={"error_code": "CA_UNAVAILABLE"})
+
+    # 1. Decodare și parsare CSR
+    try:
+        csr_bytes = base64.b64decode(payload.csr_pem_b64)
+        csr = x509.load_pem_x509_csr(csr_bytes)
+    except Exception:
+        logger.warning(
+            "CSR invalid (decodare sau parsare eșuată)",
+            extra={"event_type": "PKI_RENEWAL_FAILED", "terminal_id": terminal_id, "reason": "INVALID_CSR"}
+        )
+        raise HTTPException(status_code=400, detail={"error_code": "INVALID_CSR"})
+
+    # 2. Extragere CN din CSR
+    try:
+        csr_cn = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+    except (IndexError, Exception):
+        logger.warning(
+            "CSR fără câmp CN",
+            extra={"event_type": "PKI_RENEWAL_FAILED", "terminal_id": terminal_id, "reason": "MISSING_CN"}
+        )
+        raise HTTPException(status_code=400, detail={"error_code": "INVALID_CSR", "detail": "CN lipsă din CSR"})
+
+    # 3. Validare CN: un terminal nu poate reînnoi certificatul altui terminal
+    ssl_dn = request.headers.get("X-SSL-Client-DN", "")
+    cn_match = re.search(r"CN=([^,/]+)", ssl_dn)
+    mtls_cn = cn_match.group(1).strip() if cn_match else None
+
+    if mtls_cn and csr_cn != mtls_cn:
+        logger.warning(
+            f"CN mismatch: CSR CN={csr_cn}, mTLS CN={mtls_cn}",
+            extra={"event_type": "PKI_RENEWAL_FAILED", "terminal_id": terminal_id, "reason": "CN_MISMATCH"}
+        )
+        raise HTTPException(status_code=403, detail={"error_code": "CN_MISMATCH"})
+
+    # 4. Semnare CSR cu CA-ul intern
+    try:
+        now = datetime.now(timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(csr.subject)
+            .issuer_name(CA_CERT.subject)
+            .public_key(csr.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + timedelta(days=30))
+            .add_extension(
+                x509.BasicConstraints(ca=False, path_length=None),
+                critical=True
+            )
+            .sign(CA_KEY, hashes.SHA256())
+        )
+
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+        ca_pem = CA_CERT.public_bytes(serialization.Encoding.PEM)
+
+    except Exception as e:
+        logger.error(
+            f"Eroare la semnarea CSR: {e}",
+            extra={"event_type": "PKI_RENEWAL_FAILED", "terminal_id": terminal_id, "reason": "SIGNING_ERROR"}
+        )
+        raise HTTPException(status_code=500, detail={"error_code": "SIGNING_ERROR"})
+
+    logger.info(
+        f"Certificat nou emis pentru terminal {terminal_id} (CN={csr_cn})",
+        extra={"event_type": "PKI_RENEWAL_SUCCESS", "terminal_id": terminal_id}
+    )
+
+    return {
+        "certificate_pem_b64": base64.b64encode(cert_pem).decode(),
+        "ca_certificate_pem_b64": base64.b64encode(ca_pem).decode(),
+        "valid_days": 30,
+        "issued_at": now.isoformat()
+    }
+
 
 # --- PORNIRE ---
 if __name__ == "__main__":

@@ -32,10 +32,6 @@
         "alertInstanceLabelFilter": "",
         "alertName": "",
         "dashboardAlerts": false,
-        "folder": {
-          "title": "Alerts",
-          "uid": "bflxz1mhed5oge"
-        },
         "groupBy": [],
         "groupMode": "default",
         "maxItems": 20,

@@ -11,7 +11,7 @@
           "id": 1,
           "uid": "fflxz3333dypsa",
           "orgID": 1,
-          "folderUID": "bflxz1mhed5oge",
+          "folderUID": "efn5a3cywzif4d",
           "ruleGroup": "BRUTE_FORCE",
           "title": "CRYPTO_BRUTE_FORCE_DETECTED",
           "condition": "C",
@@ -23,10 +23,10 @@
                 "from": 600,
                 "to": 0
               },
-              "datasourceUid": "eflxnh32mbif4e",
+              "datasourceUid": "nfc-prometheus",
               "model": {
-                "editorMode": "builder",
-                "expr": "sum(rate(http_requests_total{job=\"issuing-bank\", status=\"4xx\"}[1m])) * 60",
+                "editorMode": "code",
+                "expr": "sum(rate(http_requests_total{job=\"issuing-bank\", status=~\"4..\"}[1m])) * 60",
                 "instant": true,
                 "intervalMs": 1000,
                 "legendFormat": "__auto",
@@ -47,18 +47,14 @@
                 "conditions": [
                   {
                     "evaluator": {
-                      "params": [
-                        10
-                      ],
+                      "params": [10],
                       "type": "gt"
                     },
                     "operator": {
                       "type": "and"
                     },
                     "query": {
-                      "params": [
-                        "C"
-                      ]
+                      "params": ["C"]
                     },
                     "reducer": {
                       "params": [],
@@ -94,7 +90,7 @@
           "id": 3,
           "uid": "dflxzmhcc2nlsc",
           "orgID": 1,
-          "folderUID": "bflxz1mhed5oge",
+          "folderUID": "efn5a3cywzif4d",
           "ruleGroup": "ERROR_RATE",
           "title": "ERROR_RATE_5XX_EXCEEDED",
           "condition": "C",
@@ -106,10 +102,10 @@
                 "from": 600,
                 "to": 0
               },
-              "datasourceUid": "eflxnh32mbif4e",
+              "datasourceUid": "nfc-prometheus",
               "model": {
-                "editorMode": "builder",
-                "expr": "sum(rate(http_requests_total{job=\"payment-gateway\", status=~\"5xx\"}[1m])) / (rate(http_requests_total{job=\"payment-gateway\"}[1m]) * 100)",
+                "editorMode": "code",
+                "expr": "sum(rate(http_requests_total{job=\"payment-gateway\", status=~\"5..\"}[1m])) / sum(rate(http_requests_total{job=\"payment-gateway\"}[1m])) * 100",
                 "instant": true,
                 "intervalMs": 1000,
                 "legendFormat": "__auto",
@@ -130,18 +126,14 @@
                 "conditions": [
                   {
                     "evaluator": {
-                      "params": [
-                        1
-                      ],
+                      "params": [1],
                       "type": "gt"
                     },
                     "operator": {
                       "type": "and"
                     },
                     "query": {
-                      "params": [
-                        "C"
-                      ]
+                      "params": ["C"]
                     },
                     "reducer": {
                       "params": [],
@@ -177,10 +169,10 @@
           "id": 2,
           "uid": "bflxz8sxyn20wa",
           "orgID": 1,
-          "folderUID": "bflxz1mhed5oge",
+          "folderUID": "efn5a3cywzif4d",
           "ruleGroup": "SLA_BREACH",
           "title": "SLA_BREACH_P95",
-          "condition": "A",
+          "condition": "B",
           "data": [
             {
               "refId": "A",
@@ -189,10 +181,10 @@
                 "from": 600,
                 "to": 0
               },
-              "datasourceUid": "eflxnh32mbif4e",
+              "datasourceUid": "nfc-prometheus",
               "model": {
                 "editorMode": "code",
-                "expr": "histogram_quantile(0.95, sum by (le) (\r\n    rate(http_request_duration_seconds_bucket{\r\n        job=\"payment-gateway\",\r\n        handler=\"/api/v1/payments/authorize\"\r\n    }[1m])\r\n)) \r\nand \r\nsum(rate(http_requests_total{job=\"payment-gateway\"}[1m])) > 0\r\n",
+                "expr": "histogram_quantile(0.95, sum by (le) (\n    rate(http_request_duration_seconds_bucket{\n        job=\"payment-gateway\",\n        handler=\"/api/v1/payments/authorize\"\n    }[1m])\n))\nand\nsum(rate(http_requests_total{job=\"payment-gateway\"}[1m])) > 0\n",
                 "instant": true,
                 "intervalMs": 1000,
                 "legendFormat": "__auto",
@@ -203,7 +195,7 @@
             },
             {
               "refId": "B",
-              "queryType": "",
+              "queryType": "expression",
               "relativeTimeRange": {
                 "from": 0,
                 "to": 0
@@ -213,10 +205,7 @@
                 "conditions": [
                   {
                     "evaluator": {
-                      "params": [
-                        1.5,
-                        0
-                      ],
+                      "params": [1.5, 0],
                       "type": "gt"
                     },
                     "operator": {

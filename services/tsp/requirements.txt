@@ -38,3 +38,6 @@ httpx==0.27.0
 # Necesare pentru a exporta metrici în format Prometheus (/metrics)
 # și pentru a expune endpoint-ul /health corespunzător specificațiilor
 prometheus-fastapi-instrumentator==6.1.0
+
+# Asynclibria pentru Postgres
+asyncpg

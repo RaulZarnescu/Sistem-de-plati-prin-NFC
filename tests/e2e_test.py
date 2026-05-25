@@ -46,10 +46,10 @@ import httpx
 GATEWAY_URL = os.getenv("TEST_GATEWAY_URL", "http://localhost:8001")
 
 # Cheile HMAC — disponibile în container via env_file: .env
-_hex_a = os.getenv("ISSUING_BANK_HMAC_MASTER_KEY", "")
+_hex_a = os.getenv("BANK_BT_HMAC_KEY", "")
 HMAC_KEY_A = bytes.fromhex(_hex_a) if _hex_a else b""
 
-_hex_b = os.getenv("ISSUING_BANK_B_HMAC_MASTER_KEY", "")
+_hex_b = os.getenv("BANK_BCR_HMAC_KEY", "")
 HMAC_KEY_B = bytes.fromhex(_hex_b) if _hex_b else b""
 
 # Terminal ID folosit în teste
@@ -161,16 +161,16 @@ def preflight():
     print("\n🔍 Preflight checks...")
     ok = True
     if not HMAC_KEY_A:
-        print("  ❌ ISSUING_BANK_HMAC_MASTER_KEY nu este setată în mediu!")
+        print("  ❌ BANK_BT_HMAC_KEY nu este setată în mediu!")
         ok = False
     else:
-        print(f"  ✅ HMAC Key A prezentă ({len(HMAC_KEY_A)} bytes)")
+        print(f"  ✅ HMAC Key BT/A prezentă ({len(HMAC_KEY_A)} bytes)")
 
     if not HMAC_KEY_B:
-        print("  ❌ ISSUING_BANK_B_HMAC_MASTER_KEY nu este setată în mediu!")
+        print("  ❌ BANK_BCR_HMAC_KEY nu este setată în mediu!")
         ok = False
     else:
-        print(f"  ✅ HMAC Key B prezentă ({len(HMAC_KEY_B)} bytes)")
+        print(f"  ✅ HMAC Key BCR/B prezentă ({len(HMAC_KEY_B)} bytes)")
 
     if not ok:
         print("\n  STOP: Cheile HMAC lipsesc. Verifică .env și env_file din docker-compose.yml")

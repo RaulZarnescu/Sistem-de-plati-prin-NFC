@@ -75,6 +75,9 @@ services:
       - ./services/gateway:/app
       # Montăm și folderul shared (codul comun)
       - ./shared:/app/shared
+      # CA-ul intern pentru semnarea CSR-urilor (PKI renewal)
+      - ./certs/ca.crt:/app/certs/ca.crt:ro
+      - ./certs/ca.key:/app/certs/ca.key:ro
 
 
   # ============================================================
@@ -86,6 +89,8 @@ services:
       context: ./services/tsp
       dockerfile: Dockerfile
     container_name: nfc-tsp
+    ports:
+      - "8002:8002"
     expose:
       - "8002"             # intern doar — accesat prin gateway, nu direct din exterior
     environment:
@@ -123,24 +128,31 @@ services:
       - ./services/card_network:/app
       - ./shared:/app/shared
 
-
   # ============================================================
   # SERVICIUL 4: Issuing Bank
   # ============================================================
-  issuing-bank:
+
+  issuing-bank-bt:
     build:
       context: ./services/issuing_bank
       dockerfile: Dockerfile
-    container_name: nfc-issuing-bank
+    container_name: nfc-issuing-bank-bt
     expose:
-      - "8004"             # intern doar — apelat de card-network, nu expus public
+      - "8004"
     environment:
       - ENVIRONMENT=${ENVIRONMENT}
-      - ISSUING_BANK_PORT=${ISSUING_BANK_PORT}
-      - ISSUING_BANK_HMAC_MASTER_KEY=${ISSUING_BANK_HMAC_MASTER_KEY}
+      - ISSUING_BANK_PORT=8004
+      - BANK_ID=BT
+      - POSTGRES_BANK_DB=bank_bt
+      - POSTGRES_BANK_USER=bank_bt
+      - POSTGRES_BANK_PASSWORD=${BANK_BT_DB_PASSWORD:-bt_secret}
+      - ISSUING_BANK_HMAC_MASTER_KEY=${BANK_BT_HMAC_KEY}
       - FRAUD_SCORE_ALLOW_THRESHOLD=${FRAUD_SCORE_ALLOW_THRESHOLD}
       - FRAUD_SCORE_STEP_UP_THRESHOLD=${FRAUD_SCORE_STEP_UP_THRESHOLD}
       - FRAUD_DECAY_LAMBDA=${FRAUD_DECAY_LAMBDA}
+      - REDIS_HOST=redis-master
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
     env_file:
       - .env
     networks:
@@ -149,25 +161,72 @@ services:
     volumes:
       - ./services/issuing_bank:/app
       - ./shared:/app/shared
+      - ./certs/bank_bt_private.pem:/app/certs/bank_private.pem:ro
     command: uvicorn main:app --host 0.0.0.0 --port 8004 --workers 4
 
-  issuing-bank-b:
-    build: ./services/issuing_bank_b
-    container_name: nfc-issuing-bank-b
+  issuing-bank-bcr:
+    build:
+      context: ./services/issuing_bank
+      dockerfile: Dockerfile
+    container_name: nfc-issuing-bank-bcr
     expose:
-      - "8006"             # intern doar — apelat de card-network, nu expus public
+      - "8006"
     environment:
-      - ISSUING_BANK_HMAC_MASTER_KEY=${ISSUING_BANK_B_HMAC_MASTER_KEY}
-      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - ENVIRONMENT=${ENVIRONMENT}
+      - ISSUING_BANK_PORT=8006
+      - BANK_ID=BCR
+      - POSTGRES_BANK_DB=bank_bcr
+      - POSTGRES_BANK_USER=bank_bcr
+      - POSTGRES_BANK_PASSWORD=${BANK_BCR_DB_PASSWORD:-bcr_secret}
+      - ISSUING_BANK_HMAC_MASTER_KEY=${BANK_BCR_HMAC_KEY}
+      - FRAUD_SCORE_ALLOW_THRESHOLD=${FRAUD_SCORE_ALLOW_THRESHOLD}
+      - FRAUD_SCORE_STEP_UP_THRESHOLD=${FRAUD_SCORE_STEP_UP_THRESHOLD}
+      - FRAUD_DECAY_LAMBDA=${FRAUD_DECAY_LAMBDA}
+      - REDIS_HOST=redis-master
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
     env_file:
       - .env
     networks:
       - payment-network
     restart: unless-stopped
     volumes:
-      - ./services/issuing_bank_b:/app
+      - ./services/issuing_bank:/app
       - ./shared:/app/shared
+      - ./certs/bank_bcr_private.pem:/app/certs/bank_private.pem:ro
     command: uvicorn main:app --host 0.0.0.0 --port 8006 --workers 4
+
+  issuing-bank-ing:
+    build:
+      context: ./services/issuing_bank
+      dockerfile: Dockerfile
+    container_name: nfc-issuing-bank-ing
+    expose:
+      - "8007"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - ISSUING_BANK_PORT=8007
+      - BANK_ID=ING
+      - POSTGRES_BANK_DB=bank_ing
+      - POSTGRES_BANK_USER=bank_ing
+      - POSTGRES_BANK_PASSWORD=${BANK_ING_DB_PASSWORD:-ing_secret}
+      - ISSUING_BANK_HMAC_MASTER_KEY=${BANK_ING_HMAC_KEY}
+      - FRAUD_SCORE_ALLOW_THRESHOLD=${FRAUD_SCORE_ALLOW_THRESHOLD}
+      - FRAUD_SCORE_STEP_UP_THRESHOLD=${FRAUD_SCORE_STEP_UP_THRESHOLD}
+      - FRAUD_DECAY_LAMBDA=${FRAUD_DECAY_LAMBDA}
+      - REDIS_HOST=redis-master
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    env_file:
+      - .env
+    networks:
+      - payment-network
+    restart: unless-stopped
+    volumes:
+      - ./services/issuing_bank:/app
+      - ./shared:/app/shared
+      - ./certs/bank_ing_private.pem:/app/certs/bank_private.pem:ro
+    command: uvicorn main:app --host 0.0.0.0 --port 8007 --workers 4
 
   # ============================================================
   # SERVICIUL 5: Dashboard
@@ -290,6 +349,46 @@ services:
       - redis-data:/data
 
 
+  # ============================================================
+  # SERVICIUL 8: Postgres pentru TSP
+  # ============================================================
+  postgres-tsp:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tsp_db
+      POSTGRES_USER: tsp_user
+      POSTGRES_PASSWORD: ${POSTGRES_TSP_PASSWORD:-tsp_secret}
+    volumes:
+      - postgres_tsp_data:/var/lib/postgresql/data
+      - ./db/init/tsp:/docker-entrypoint-initdb.d:ro
+    networks:
+      - payment-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tsp_user -d tsp_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================
+  # SERVICIUL 9: Postgres pentru Issuing Bank
+  # ============================================================
+  postgres-bank:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_BANK_PASSWORD:-postgres_secret}
+    volumes:
+      - postgres_bank_data:/var/lib/postgresql/data
+      - ./db/init/bank:/docker-entrypoint-initdb.d:ro
+    networks:
+      - payment-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 # ============================================================
 # NETWORKS — Rețelele virtuale Docker
 #
@@ -304,7 +403,7 @@ networks:
     # "bridge" = tipul implicit, potrivit pentru un singur server
     driver: bridge
     # Numele rețelei vizibil în "docker network ls"
-    name: nfc-payment-network
+    name: payment-network
 
 
 # ============================================================
@@ -319,6 +418,8 @@ volumes:
     name: nfc-redis-data
     
   grafana_data:
+  postgres_tsp_data:
+  postgres_bank_data:
 
 
 
