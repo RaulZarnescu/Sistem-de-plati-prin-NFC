@@ -39,5 +39,10 @@ openssl x509 -req -days 30 \
     -CAcreateserial \
     -out $CERTS_DIR/pos-buc-001.crt
 
+echo "=== 4. Generare chei private pentru Issuing Banks ==="
+openssl genrsa -out $CERTS_DIR/bank_bt_private.pem 2048
+openssl genrsa -out $CERTS_DIR/bank_bcr_private.pem 2048
+openssl genrsa -out $CERTS_DIR/bank_ing_private.pem 2048
+
 echo "=== Certificate generate în $CERTS_DIR/ ==="
 ls -la $CERTS_DIR/

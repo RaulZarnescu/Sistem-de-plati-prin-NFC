@@ -66,15 +66,16 @@ cp .env.example .env
 # NICIODATĂ nu urca .env pe GitHub
 ```
 
-### 3. Generează certificatele mTLS
+### 3. Rulează configurarea automată (Setup)
+Acest proiect conține un script de setup automat cross-platform (`setup.py`) care se ocupă de crearea fișierului `.env`, ștergerea directoarelor de certificate invalide, convertirea sfârșitului de rânduri și generarea automată a tuturor certificatelor mTLS și a cheilor private pentru bănci direct într-un container temporar Docker Alpine:
+
 ```bash
-# Script care va fi adăugat în curând
-# bash scripts/generate-certs.sh
+python setup.py
 ```
 
 ### 4. Pornește toate serviciile
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
 
 ### 5. Verifică că totul rulează
