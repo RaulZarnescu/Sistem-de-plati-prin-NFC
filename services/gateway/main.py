@@ -22,6 +22,7 @@
 # Request = reprezintă o cerere HTTP primită
 
 from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import uuid
 import time
@@ -426,7 +427,11 @@ async def challenge_payment(
                     "pin_block_encrypted": payload.pin_block_encrypted
                 }
             )
-        return bank_response.json()
+        # Propagăm status code-ul exact de la bancă (400 INCORRECT_PIN, 503, etc.)
+        return JSONResponse(
+            content=bank_response.json(),
+            status_code=bank_response.status_code
+        )
     except httpx.TimeoutException:
         raise HTTPException(503, {"error_code": "BANK_TIMEOUT"})
 

@@ -39,7 +39,7 @@ BANK_PRIVATE_KEY = None
 redis_client: Optional[aioredis.Redis] = None
 db_pool: Optional[asyncpg.Pool] = None
 
-from shared.crypto_utils import verify_mac
+from shared.crypto_utils import verify_mac, verify_pin
 
 load_dotenv()
 
@@ -297,54 +297,130 @@ async def challenge_payment(payload: ChallengeRequest):
             }
         )
 
-    # PIN extras — în PoC acceptăm orice PIN valid (4-6 cifre)
-    # Producție: comparare cu PIN hash stocat în HSM
-    pin = "".join(filter(str.isdigit, pin_block_str))[:6]
+    # Parsare format PIN Block: "{transaction_id}:{pin}"
+    # Anti-replay verificat deja — transaction_id e prezent în pin_block_str
+    parts = pin_block_str.split(":")
+    if len(parts) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "INVALID_PIN_BLOCK",
+                "message": "Format PIN Block invalid.",
+                "action_required": "RETRY_WITH_PIN"
+            }
+        )
 
-    if len(pin) < 4:
+    pin = parts[1].strip()
+
+    # Validare format PIN: 4-6 cifre
+    # NOTĂ SECURITATE: mesaj deliberat vag după decriptare — nu dezvăluie
+    # dacă PIN-ul e prea scurt, prea lung sau conține caractere invalide.
+    # EXCEPȚIE: validare format (înainte de lookup DB) poate fi specifică.
+    if not pin.isdigit() or len(pin) < 4 or len(pin) > 6:
         logger.warning(
-            "PIN invalid — lungime incorectă.",
+            "PIN format invalid.",
             extra={"event_type": "PIN_INVALID", "trace_id": trace_id}
         )
         raise HTTPException(
             status_code=400,
             detail={
                 "error_code": "INVALID_PIN",
-                "message": "PIN invalid.",
+                "message": "PIN trebuie să fie 4-6 cifre.",
                 "action_required": "RETRY_WITH_PIN"
             }
         )
 
+    if not db_pool:
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "SERVICE_UNAVAILABLE"}
+        )
+
+    # Citim PAN-ul și suma din tranzacția CHALLENGE_REQUIRED stocată în DB
+    # (stocarea se face în authorize_transaction ÎNAINTE de a ridica 401)
+    async with db_pool.acquire() as conn:
+        txn_row = await conn.fetchrow(
+            "SELECT pan, amount FROM transactions WHERE transaction_id = $1",
+            payload.transaction_id
+        )
+        if not txn_row:
+            logger.error(
+                f"Transaction ID necunoscut în challenge: {payload.transaction_id}",
+                extra={"event_type": "PIN_VERIFY_FAILED", "trace_id": trace_id}
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error_code": "TRANSACTION_NOT_FOUND",
+                    "message": "Tranzacția originală nu a fost găsită.",
+                    "action_required": "DECLINE_TRANSACTION"
+                }
+            )
+        pan = txn_row["pan"]
+        account_row = await conn.fetchrow(
+            "SELECT pin_hash FROM accounts WHERE pan = $1", pan
+        )
+
+    if not account_row or not account_row["pin_hash"]:
+        logger.error(
+            "PIN hash lipsă pentru cont — configurare incompletă.",
+            extra={"event_type": "PIN_VERIFY_FAILED", "trace_id": trace_id}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "SERVICE_UNAVAILABLE",
+                "message": "Configurare cont incompletă."
+            }
+        )
+
+    # verify_pin folosește hmac.compare_digest — timing-safe obligatoriu
+    # PIN-ul NU apare niciodată în log-uri (nici ca hint în mesajul de eroare)
+    pin_valid = verify_pin(pin, pan, account_row["pin_hash"])
+    if not pin_valid:
+        logger.warning(
+            f"PIN incorect pentru tranzacția {payload.transaction_id}.",
+            extra={"event_type": "PIN_INCORRECT", "trace_id": trace_id}
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "INCORRECT_PIN",
+                "message": "PIN incorect. Tranzacție refuzată.",
+                "action_required": "RETRY_WITH_PIN"
+            }
+        )
+
+    # PIN corect — aprobăm tranzacția Step-Up
     logger.info(
-        f"PIN validat cu succes pentru tranzacția {payload.transaction_id}.",
+        "PIN verificat cu succes.",
         extra={"event_type": "PIN_VALIDATED", "trace_id": trace_id}
     )
 
-    # Tranzacția Step-Up e aprobată
-    transaction_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+    approval_txn_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
     now = datetime.now(timezone.utc)
 
-    # Salvare în PostgreSQL
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                async with conn.transaction():
-                    await conn.execute("""
-                        INSERT INTO transactions
-                            (transaction_id, pan, amount, currency,
-                             status, risk_score, terminal_id, bank, created_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    """,
-                        transaction_id, "STEP-UP", 0, "RON",
-                        "APPROVED", 0, payload.terminal_id, BANK_ID, now
-                    )
-        except Exception as e:
-            logger.error(f"Eroare scriere challenge în DB: {e}",
-                        extra={"event_type": "DB_ERROR", "trace_id": trace_id})
+    try:
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("""
+                    INSERT INTO transactions
+                        (transaction_id, pan, amount, currency,
+                         status, risk_score, terminal_id, bank, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                    approval_txn_id, pan, txn_row["amount"],
+                    "RON", "APPROVED", 0, payload.terminal_id, BANK_ID, now
+                )
+    except Exception as e:
+        logger.error(
+            f"Eroare scriere APPROVED challenge în DB: {e}",
+            extra={"event_type": "DB_ERROR", "trace_id": trace_id}
+        )
 
     return {
         "status": "APPROVED",
-        "transaction_id": transaction_id,
+        "transaction_id": approval_txn_id,
         "auth_code": uuid.uuid4().hex[:8].upper(),
         "processed_at": now.isoformat()
     }
@@ -503,6 +579,27 @@ async def authorize_transaction(payload: IssuingBankRequest):
             extra={"event_type": "TX_REJECTED", "trace_id": trace_id}
         )
     elif final_risk >= 40:
+        # Generăm transaction_id ÎNAINTE de stocare — challenge endpoint îl va căuta în DB
+        challenge_txn_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute("""
+                            INSERT INTO transactions
+                                (transaction_id, pan, amount, currency,
+                                 status, risk_score, terminal_id, bank, created_at)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        """,
+                            challenge_txn_id, payload.pan,
+                            payload.transaction.amount, payload.transaction.currency,
+                            "CHALLENGE_REQUIRED", final_risk, payload.terminal_id, BANK_ID, now
+                        )
+            except Exception as e:
+                logger.error(
+                    f"Eroare stocare CHALLENGE_REQUIRED în DB: {e}",
+                    extra={"event_type": "DB_ERROR", "trace_id": trace_id}
+                )
         logger.info(
             f"Step-Up Authentication cerut. Risk score: {final_risk}",
             extra={"event_type": "TX_STEP_UP", "trace_id": trace_id}
@@ -512,7 +609,7 @@ async def authorize_transaction(payload: IssuingBankRequest):
             detail={
                 "error_code": "CHALLENGE_REQUIRED",
                 "risk_score": final_risk,
-                "transaction_id": f"TXN-{uuid.uuid4().hex[:12].upper()}"
+                "transaction_id": challenge_txn_id
             }
         )
     else:

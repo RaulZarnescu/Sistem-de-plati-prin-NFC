@@ -1,0 +1,24 @@
+{
+    "Servers": {
+        "1": {
+            "Name": "NFC — postgres-bank",
+            "Group": "NFC Payment System",
+            "Host": "postgres-bank",
+            "Port": 5432,
+            "MaintenanceDB": "postgres",
+            "Username": "postgres",
+            "SSLMode": "prefer",
+            "Comment": "Conține DB-urile bank_bt, bank_bcr, bank_ing. Parola: din POSTGRES_BANK_PASSWORD (.env)"
+        },
+        "2": {
+            "Name": "NFC — postgres-tsp",
+            "Group": "NFC Payment System",
+            "Host": "postgres-tsp",
+            "Port": 5432,
+            "MaintenanceDB": "tsp_db",
+            "Username": "tsp_user",
+            "SSLMode": "prefer",
+            "Comment": "Token Vault — baza de date TSP. Parola: din POSTGRES_TSP_PASSWORD (.env)"
+        }
+    }
+}

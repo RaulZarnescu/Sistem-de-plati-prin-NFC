@@ -407,6 +407,29 @@ services:
       retries: 5
 
 # ============================================================
+# SERVICIUL 10: PgAdmin
+# ============================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: nfc-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@nfc.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres-bank:
+        condition: service_healthy
+      postgres-tsp:
+        condition: service_healthy
+    networks:
+      - payment-network
+    restart: unless-stopped
+
+# ============================================================
 # NETWORKS — Rețelele virtuale Docker
 #
 # De ce creăm o rețea separată?
@@ -433,11 +456,11 @@ networks:
 volumes:
   redis-data:
     name: nfc-redis-data
-    
+
   grafana_data:
   postgres_tsp_data:
   postgres_bank_data:
-
+  pgadmin_data:
 
 
 

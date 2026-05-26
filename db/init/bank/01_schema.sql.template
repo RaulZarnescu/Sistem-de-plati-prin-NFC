@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     exp_month   VARCHAR(2)   NOT NULL DEFAULT '12',
     exp_year    VARCHAR(4)   NOT NULL DEFAULT '28',
     cvv_hash    VARCHAR(64),  -- SHA256(pan || cvv) — NICIODATĂ plain text (PCI-DSS)
+    pin_hash    VARCHAR(64),  -- SHA256(pan || pin) — PoC; producție: PBKDF2-HMAC-SHA256
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
@@ -12,6 +13,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS exp_month VARCHAR(2) DEFAULT '12';
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS exp_year VARCHAR(4) DEFAULT '28';
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cvv_hash VARCHAR(64);
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(64);
 
 CREATE TABLE IF NOT EXISTS transactions (
     id              SERIAL       PRIMARY KEY,
@@ -42,15 +44,68 @@ CREATE TRIGGER make_transactions_immutable
 BEFORE UPDATE OR DELETE ON transactions
 FOR EACH ROW EXECUTE FUNCTION prevent_update_delete();
 
--- Seed accounts pentru DPANs existente
--- cvv_hash = SHA256(pan || '123') — CVV de test: 123 pentru toate conturile
--- PCI-DSS: CVV NICIODATĂ stocat plain text
+-- ============================================================
+-- Seed accounts
+--
+-- cvv_hash = SHA256(pan || cvv) — PCI-DSS: CVV NICIODATĂ plain text
+-- CVV-urile de test sunt documentate EXCLUSIV în docs/DEMO_SCENARIOS.md
+--
+-- NOTĂ Luhn: PANs legacy (4000001111111111, 5000002222222222 etc.)
+-- nu trec algoritmul Luhn — sunt PoC fixtures create înainte de validare.
+-- Toate PANs "Demo v2" (prefix 400000*, 510510*, 520082*) sunt Luhn-valide.
+-- ============================================================
+
 INSERT INTO accounts (pan, balance, exp_month, exp_year, cvv_hash) VALUES
+
+    -- ── Legacy PANs (backward compat — tokeni TSP existenți referențiează aceste PAN-uri) ──
     ('4000001111111111', 100000, '12', '28', '30bc5c317cc09eda99bc6c0333feaeb7f7aa2f13d35172d66fde4ee589de6d54'),
     ('5000002222222222', 100000, '10', '27', '83f8a3cef153030b926e5f96b0b20cb60a4783bc72473c3926ec3fb9c1c29522'),
     ('5111113333333333', 100000, '06', '29', '13e7e32081bd408620a7ccfcb45521ac5c7049bc08954c3812ee23ab201b3469'),
-    ('4222222222222222', 100000, '12', '28', 'a322ea28be32888af1341a48f1076124c50fb792eaf56042311d01d847da5ba9')
+    ('4222222222222222', 100000, '12', '28', 'a322ea28be32888af1341a48f1076124c50fb792eaf56042311d01d847da5ba9'),
+
+    -- ── Demo v2 — BT (prefix 400000) — Luhn-valide ──
+    -- SC1 Happy Path (sold 1500 RON)   | CVV → docs/DEMO_SCENARIOS.md
+    ('4000001111111118', 150000, '12', '28', 'fae3a31c2e0b6d7c5cbd34dababa662506654ce1dd4cd0013d5eab5c5d54704f'),
+    -- SC4 Sold Insuficient (sold 50 RON)
+    ('4000002222222224',   5000, '06', '27', '696e8b4df2c1458029278867d8c0fb8755661fa33c38d0d5e845ff7778e06367'),
+    -- BT rezervă (sold 5000 RON)
+    ('4000003333333306', 500000, '03', '29', '4f4eefaba329faea8039af429fe366b69b0d10b8d846f61a1b92bf1b837100e2'),
+
+    -- ── Demo v2 — BCR (prefix 510510) — Luhn-valide ──
+    -- SC2 Velocity Fraud (sold 2000 RON)
+    ('5105105105105100', 200000, '12', '28', '79d119de6fe25c1e78b03bbc6a1d5a0f5ad1e774fc7fcd0a0181a1c1372e1d12'),
+    -- BCR rezervă 1 (sold 3000 RON)
+    ('5105105105105118', 300000, '09', '27', '60131c37ed439c298108c3d77bbd6bed18742c37052f3514bd37768e93089b3f'),
+    -- BCR rezervă 2 (sold 1000 RON)
+    ('5105105105105126', 100000, '04', '29', '8181ed6047eac7f5d96d6f248c580a7b9551773bba49767c011b636a36f22a0d'),
+
+    -- ── Demo v2 — ING (prefix 520082) — Luhn-valide ──
+    -- SC3 Amount Deviation (sold 2500 RON)
+    ('5200828282828210', 250000, '12', '28', 'ad44e83829fa188bb4a8b29cea8a99b1882fc1eef23ab10c585c4129470ca5d8'),
+    -- ING rezervă 1 (sold 1500 RON)
+    ('5200828282828228', 150000, '08', '27', '551191f87a5372d37ba7b9ea63cee8b221d8662eacdc09c86469046e7703e582'),
+    -- ING rezervă 2 (sold 500 RON)
+    ('5200828282828236',  50000, '05', '29', 'dac8f5079543355ed93385e067e5b1ac044158f4527aaac5dc75df38b70f92c8')
+
 ON CONFLICT (pan) DO UPDATE SET
     exp_month = EXCLUDED.exp_month,
     exp_year  = EXCLUDED.exp_year,
     cvv_hash  = EXCLUDED.cvv_hash;
+-- NOTĂ: balance și pin_hash nu se suprascriu la conflict — soldul și PIN-ul existent se păstrează
+
+-- ============================================================
+-- PIN hash pentru toate conturile de test
+-- Formula: SHA256(pan || '1234') cu salt implicit = pan
+--
+-- PoC simplification: SHA256 simplu e vulnerabil la brute-force
+-- pe PIN-uri de 4 cifre (10.000 combinații). Acceptabil pentru demo.
+-- Producție OBLIGATORIU: PBKDF2-HMAC-SHA256 cu 100.000 iterații
+-- și salt random per cont stocat separat în coloană dedicată.
+--
+-- PIN de test pentru TOATE conturile: 1234
+-- CVV-urile sunt în docs/DEMO_SCENARIOS.md — PIN-ul NU apare niciodată
+-- în fișiere SQL sau cod sursă (aceeași regulă ca CVV).
+-- ============================================================
+UPDATE accounts
+SET pin_hash = encode(sha256((pan || '1234')::bytea), 'hex')
+WHERE pin_hash IS NULL;

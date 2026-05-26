@@ -112,3 +112,55 @@ def verify_mac(
 
     # Comparație în timp constant (protecție Timing Attack)
     return hmac.compare_digest(expected_mac, received_mac)
+
+
+def hash_pin(pin: str, pan: str) -> str:
+    """
+    Calculează hash-ul PIN-ului folosind SHA256(pan + pin).
+
+    De ce pan ca salt?
+    Fără salt, hash-uri identice pentru același PIN pe conturi diferite
+    ar permite atacuri de tip rainbow table. Folosirea PAN-ului ca salt
+    garantează că hash-urile sunt unice per cont.
+
+    PoC: SHA256 simplu — vulnerabil la brute-force pe 10.000 combinații PIN.
+    Producție OBLIGATORIU: PBKDF2-HMAC-SHA256 cu 100.000 iterații și
+    salt random per cont stocat separat.
+
+    Parametri:
+        pin  : PIN-ul în clar (ex: "1234") — NICIODATĂ logat
+        pan  : PAN-ul cardului — folosit ca salt implicit
+
+    Returnează:
+        String hex SHA256 (64 caractere)
+    """
+    combined = (pan + pin).encode("utf-8")
+    return hashlib.sha256(combined).hexdigest()
+
+
+def verify_pin(received_pin: str, pan: str, stored_hash: str) -> bool:
+    """
+    Verifică PIN-ul folosind comparație timing-safe (HMAC-safe).
+
+    De ce hmac.compare_digest și NU "=="?
+    Operatorul == returnează False la primul caracter diferit → timing attack:
+    un atacator poate deduce câte caractere sunt corecte măsurând timpul de răspuns.
+    hmac.compare_digest() compară TOATE caracterele în timp constant.
+
+    REGULĂ DE SECURITATE: received_pin NU apare niciodată în log-uri.
+    Corect:   logger.info("PIN verificat cu succes")
+    GREȘIT:   logger.info(f"PIN primit: {received_pin}")  ← interzis
+
+    Parametri:
+        received_pin  : PIN-ul primit de la utilizator (ex: "1234")
+        pan           : PAN-ul cardului (salt pentru hash)
+        stored_hash   : Hash-ul stocat în DB (din coloana pin_hash)
+
+    Returnează:
+        True dacă PIN-ul e corect, False altfel
+    """
+    if not stored_hash:
+        return False
+    computed = hash_pin(received_pin, pan)
+    # hmac.compare_digest — OBLIGATORIU. Operatorul == e interzis aici.
+    return hmac.compare_digest(computed, stored_hash)

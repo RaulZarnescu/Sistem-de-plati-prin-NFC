@@ -14,12 +14,44 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 import httpx
+import redis as redis_sync
 
 GATEWAY_URL = os.getenv("TEST_GATEWAY_URL", "http://localhost:8001")
 TERMINAL_ID = "POS-CHALLENGE-TEST"
 
 _hex_a = os.getenv("BANK_BT_HMAC_KEY", "")
 HMAC_KEY_BT = bytes.fromhex(_hex_a) if _hex_a else b""
+
+# DPAN dedicat testelor de challenge PIN
+# Token TSP: TEST-CHALLENGE-PIN → PAN 4000001111111118 (BT SC1), risk_level=50
+# risk_level=50: cu Redis fresh → final_risk=50 → CHALLENGE_REQUIRED (40≤50≤75)
+CHALLENGE_DPAN = "TEST-CHALLENGE-PIN"
+CHALLENGE_PAN  = "4000001111111118"  # PAN din accounts bank_bt cu pin_hash setat
+
+# Conexiune Redis pentru reset stare fraudă între teste
+REDIS_HOST     = os.getenv("REDIS_HOST", "redis-master")
+REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+
+
+def reset_fraud_state(pan: str) -> None:
+    """
+    Șterge cheile Redis de fraudă (velocity, risk, amounts) pentru un PAN.
+    Apelat înainte de fiecare trigger CHALLENGE_REQUIRED pentru teste izolate.
+    Fără reset, acumularea velocity din rulări anterioare poate muta scorul
+    din zona CHALLENGE_REQUIRED (40-75) în DECLINED (>75).
+    """
+    r = redis_sync.Redis(
+        host=REDIS_HOST, port=REDIS_PORT,
+        password=REDIS_PASSWORD, decode_responses=True
+    )
+    deleted = r.delete(
+        f"velocity:{pan}",
+        f"risk:{pan}",
+        f"amounts:{pan}"
+    )
+    r.close()
+    print(f"  [Redis] Reset stare fraudă pentru {pan[:4]}****{pan[-4:]} ({deleted} chei șterse)")
 
 
 def compute_mac(key, amount_cents, currency, nonce, timestamp, atc):
@@ -52,18 +84,20 @@ def encrypt_pin_block(pin_block: bytes, public_key) -> str:
     return base64.b64encode(encrypted).decode("utf-8")
 
 
-def main():
-    print("\n🔐 Test Flow Step-Up PIN Challenge")
-    print("=" * 50)
+def _trigger_challenge(pub_key) -> tuple[str, str, str]:
+    """
+    Helper comun: trimite o tranzacție Step-Up și returnează
+    (transaction_id, dpan, idemp_key) pentru challenge-ul următor.
+    Resetează starea Redis înainte de fiecare trigger pentru teste izolate.
+    """
+    # Reset stare Redis: garantăm că velocity=0 și risk=0 pentru test curat
+    reset_fraud_state(CHALLENGE_PAN)
 
-    # Pasul 1 — Tranzacție inițială care declanșează CHALLENGE_REQUIRED
-    print("\n[1/3] Trimitere tranzacție cu DPAN Step-Up...")
-    
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     nonce = uuid.uuid4().hex[:8].upper()
     atc = int(time.time() * 1000)
     amount = 10000  # 100 RON în cenți
-    dpan = "TEST-STEP-UP-BT"  # DPAN cu risk_level ridicat în Token Vault BT
+    dpan = CHALLENGE_DPAN  # TEST-CHALLENGE-PIN → 4000001111111118, risk_level=50
     idemp_key = f"CHALLENGE-{uuid.uuid4().hex[:8].upper()}"
 
     mac = compute_mac(HMAC_KEY_BT, amount, "RON", nonce, ts, atc)
@@ -88,31 +122,23 @@ def main():
         )
 
     if resp.status_code != 401:
-        print(f"  ❌ Așteptat 401, primit {resp.status_code}: {resp.json()}")
-        return
+        raise RuntimeError(f"Așteptat 401 CHALLENGE_REQUIRED, primit {resp.status_code}: {resp.json()}")
 
     challenge_data = resp.json().get("detail", {})
     transaction_id = challenge_data.get("transaction_id")
-    print(f"  ✅ 401 CHALLENGE_REQUIRED. Transaction ID: {transaction_id}")
+    if not transaction_id:
+        raise RuntimeError(f"transaction_id lipsă din răspuns: {resp.json()}")
 
-    # Pasul 2 — Construim și criptăm PIN Block
-    print("\n[2/3] Construire și criptare PIN Block...")
-    
-    # Cheia publică BT — în producție e descărcată de ESP32 via /api/pki/renew
-    try:
-        pub_key = load_public_key("/tmp/bank_bt_public.pem")
-    except FileNotFoundError:
-        print("  ❌ /tmp/bank_bt_public.pem lipsă — generează cheile RSA mai întâi")
-        return
+    return transaction_id, dpan, idemp_key
 
-    pin = "1234"  # PIN de test
+
+def _send_challenge(transaction_id: str, dpan: str, idemp_key: str, pin: str, pub_key) -> dict:
+    """
+    Helper: construiește PIN Block pentru `pin`, îl criptează și trimite challenge.
+    Returnează dict cu {status_code, body}.
+    """
     pin_block = create_pin_block(pin, transaction_id)
     encrypted_pin = encrypt_pin_block(pin_block, pub_key)
-    print(f"  ✅ PIN Block criptat ({len(encrypted_pin)} chars base64)")
-
-    # Pasul 3 — Trimitem challenge
-    print("\n[3/3] Trimitere challenge cu PIN...")
-    
     challenge_idemp = f"{idemp_key}-CHALLENGE"
 
     with httpx.Client(timeout=10.0) as client:
@@ -129,12 +155,132 @@ def main():
             }
         )
 
-    if resp.status_code == 200 and resp.json().get("status") == "APPROVED":
-        print(f"  ✅ APPROVED! Auth code: {resp.json().get('auth_code')}")
-    else:
-        print(f"  ❌ HTTP {resp.status_code}: {resp.json()}")
+    return {"status_code": resp.status_code, "body": resp.json()}
 
+
+INTER_TEST_SLEEP = 1.1  # > 1s: resetează fereastra rate limiter (2 req/s per terminal)
+
+
+def test_correct_pin(pub_key) -> bool:
+    """
+    TC-01: PIN corect (1234) → 200 APPROVED.
+    Verifică că fluxul complet Step-Up funcționează end-to-end.
+    """
+    time.sleep(INTER_TEST_SLEEP)
+    print("\n[TC-01] PIN corect (1234) → așteptat 200 APPROVED")
+    try:
+        txn_id, dpan, idemp_key = _trigger_challenge(pub_key)
+        print(f"  ✅ 401 CHALLENGE_REQUIRED. Transaction ID: {txn_id}")
+
+        result = _send_challenge(txn_id, dpan, idemp_key, "1234", pub_key)
+
+        if result["status_code"] == 200 and result["body"].get("status") == "APPROVED":
+            auth_code = result["body"].get("auth_code", "N/A")
+            print(f"  ✅ PASSED — APPROVED. Auth code: {auth_code}")
+            return True
+        else:
+            print(f"  ❌ FAILED — HTTP {result['status_code']}: {result['body']}")
+            return False
+    except Exception as e:
+        print(f"  ❌ EXCEPTION: {e}")
+        return False
+
+
+def test_wrong_pin(pub_key) -> bool:
+    """
+    TC-02: PIN greșit (9999) → 400 INCORRECT_PIN.
+    Verifică că PIN-ul incorect este respins fără a dezvălui informații
+    despre PIN-ul corect (mesaj deliberat vag).
+    """
+    time.sleep(INTER_TEST_SLEEP)
+    print("\n[TC-02] PIN greșit (9999) → așteptat 400 INCORRECT_PIN")
+    try:
+        txn_id, dpan, idemp_key = _trigger_challenge(pub_key)
+        print(f"  ✅ 401 CHALLENGE_REQUIRED. Transaction ID: {txn_id}")
+
+        result = _send_challenge(txn_id, dpan, idemp_key, "9999", pub_key)
+
+        body = result["body"]
+        error_code = body.get("detail", body).get("error_code", "") if isinstance(body.get("detail"), dict) else body.get("error_code", "")
+
+        if result["status_code"] == 400 and error_code == "INCORRECT_PIN":
+            print(f"  ✅ PASSED — 400 INCORRECT_PIN (mesaj: '{body}')")
+            return True
+        else:
+            print(f"  ❌ FAILED — HTTP {result['status_code']}: {body}")
+            return False
+    except Exception as e:
+        print(f"  ❌ EXCEPTION: {e}")
+        return False
+
+
+def test_invalid_pin_format(pub_key) -> bool:
+    """
+    TC-03: PIN prea scurt (2 cifre) → 400 INVALID_PIN.
+    Verifică validarea formatului PIN (4-6 cifre obligatoriu).
+    NOTĂ: eroarea de format este specifică — nu dezvăluie nimic despre
+    PIN-ul corect (validarea are loc înainte de compararea cu hash-ul stocat).
+    """
+    time.sleep(INTER_TEST_SLEEP)
+    print("\n[TC-03] PIN prea scurt ('12') → așteptat 400 INVALID_PIN")
+    try:
+        txn_id, dpan, idemp_key = _trigger_challenge(pub_key)
+        print(f"  ✅ 401 CHALLENGE_REQUIRED. Transaction ID: {txn_id}")
+
+        result = _send_challenge(txn_id, dpan, idemp_key, "12", pub_key)
+
+        body = result["body"]
+        error_code = body.get("detail", body).get("error_code", "") if isinstance(body.get("detail"), dict) else body.get("error_code", "")
+
+        if result["status_code"] == 400 and error_code == "INVALID_PIN":
+            print(f"  ✅ PASSED — 400 INVALID_PIN (mesaj: '{body}')")
+            return True
+        else:
+            print(f"  ❌ FAILED — HTTP {result['status_code']}: {body}")
+            return False
+    except Exception as e:
+        print(f"  ❌ EXCEPTION: {e}")
+        return False
+
+
+def main():
+    print("\n🔐 Test Flow Step-Up PIN Challenge")
+    print("=" * 50)
+
+    # Încărcare cheie publică BT — necesară pentru criptarea PIN Block
+    print("\n[0/3] Încărcare cheie publică RSA BT...")
+    try:
+        pub_key = load_public_key("/tmp/bank_bt_public.pem")
+        print("  ✅ Cheie publică încărcată.")
+    except FileNotFoundError:
+        print("  ❌ /tmp/bank_bt_public.pem lipsă — generează cheile RSA mai întâi")
+        print("     Rulează: docker exec nfc-issuing-bank-bt cat /app/keys/bank_bt_public.pem > /tmp/bank_bt_public.pem")
+        return
+
+    # Rulăm toate cele 3 teste
+    results = {
+        "TC-01 PIN corect":       test_correct_pin(pub_key),
+        "TC-02 PIN greșit":       test_wrong_pin(pub_key),
+        "TC-03 PIN format invalid": test_invalid_pin_format(pub_key),
+    }
+
+    # Sumar final
     print("\n" + "=" * 50)
+    print("SUMAR TESTE:")
+    passed = 0
+    for name, ok in results.items():
+        status = "✅ PASSED" if ok else "❌ FAILED"
+        print(f"  {status}  {name}")
+        if ok:
+            passed += 1
+
+    total = len(results)
+    print(f"\n{passed}/{total} teste trecute.")
+    if passed == total:
+        print("🎉 Toate testele au trecut!")
+    else:
+        print("⚠️  Unele teste au eșuat — verifică logurile serviciului.")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
