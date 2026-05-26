@@ -51,11 +51,14 @@ import logging
 import json
 import re
 import base64
+import hmac
+import hashlib
 # pyright: ignore [reportMissingImports]
 import httpx
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
+from jose import JWTError, jwt as jose_jwt
 
 # datetime — pentru timestamp-uri în log-uri
 from datetime import datetime, timezone, timedelta
@@ -64,6 +67,30 @@ from datetime import datetime, timezone, timedelta
 # pyright: ignore [reportMissingImports]
 from dotenv import load_dotenv
 load_dotenv()  # Apelat imediat la import, înainte de orice altceva
+
+# --- JWT CONFIG (după load_dotenv — os.getenv e valid de-abia aici) --------
+JWT_SECRET = os.getenv("JWT_SECRET_KEY", "")
+JWT_TTL_DAYS = int(os.getenv("JWT_TTL_DAYS", 90))
+JWT_ALGORITHM = "HS256"
+
+# --- ROUTING TABLE (replicat din card_network) ------------------------------
+# IIN prefix → (bank_url, bank_id) — longest-prefix-match
+BANK_ROUTING: dict[str, tuple[str, str]] = {
+    "400000": ("http://issuing-bank-bt:8004",  "BT"),
+    "422222": ("http://issuing-bank-bt:8004",  "BT"),
+    "500000": ("http://issuing-bank-bcr:8006", "BCR"),
+    "511111": ("http://issuing-bank-ing:8007", "ING"),
+    "4":      ("http://issuing-bank-bt:8004",  "BT"),
+    "5":      ("http://issuing-bank-bcr:8006", "BCR"),
+}
+
+def find_bank(pan: str) -> tuple[str, str] | None:
+    """Returnează (bank_url, bank_id) sau None — longest-prefix-match."""
+    for length in range(6, 0, -1):
+        prefix = pan[:length]
+        if prefix in BANK_ROUTING:
+            return BANK_ROUTING[prefix]
+    return None
 
 # --- CONFIGURAREA LOG-URILOR --------------------------------
 # Din specificație (Cap. 7.1): "toate componentele vor genera log-uri
@@ -185,6 +212,54 @@ app = FastAPI(
 from prometheus_fastapi_instrumentator import Instrumentator
 
 Instrumentator().instrument(app).expose(app)
+
+# --- JWT UTILITIES ------------------------------------------
+
+def create_jwt(dpan: str) -> str:
+    """Generează un JWT Bearer pentru un DPAN (Android authentication)."""
+    expire = datetime.now(timezone.utc) + timedelta(days=JWT_TTL_DAYS)
+    return jose_jwt.encode(
+        {
+            "sub": dpan,
+            "exp": expire,
+            "iat": datetime.now(timezone.utc)
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
+
+
+def verify_jwt(token: str) -> str:
+    """Decodează și verifică un JWT. Returnează dpan sau ridică HTTPException 401."""
+    try:
+        payload = jose_jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        dpan = payload.get("sub")
+        if not dpan:
+            raise JWTError("sub lipsă")
+        return dpan
+    except JWTError:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error_code": "INVALID_TOKEN",
+                "message": "Token JWT invalid sau expirat."
+            }
+        )
+
+
+def get_dpan_from_auth(authorization: Optional[str] = Header(None)) -> str:
+    """FastAPI dependency — extrage dpan din header Authorization: Bearer <token>."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error_code": "MISSING_TOKEN",
+                "message": "Header Authorization: Bearer <token> lipsă."
+            }
+        )
+    return verify_jwt(authorization.split(" ")[1])
+
+
 # --- MODELELE DE DATE (Pydantic) ----------------------------
 # Acestea definesc EXACT ce structură JSON așteptăm de la POS.
 # Pydantic validează automat: dacă lipsește un câmp obligatoriu
@@ -271,6 +346,13 @@ class ChallengePaymentRequest(BaseModel):
 
 class PKIRenewRequest(BaseModel):
     csr_pem_b64: str
+
+class EnrollRequest(BaseModel):
+    pan: str = Field(..., description="PAN-ul cardului fizic")
+    expiry_month: str = Field(..., min_length=1, max_length=2, description="Luna de expirare (ex: '12')")
+    expiry_year: str = Field(..., min_length=2, max_length=4, description="Anul de expirare (ex: '28')")
+    cvv: str = Field(..., min_length=3, max_length=4, description="CVV — verificat și aruncat, NU stocat")
+    device_id: str = Field(..., description="UUID unic al telefonului Android")
 
 # --- ENDPOINT-URI -------------------------------------------
 # Un "endpoint" = o adresă URL la care serviciul nostru răspunde
@@ -774,6 +856,280 @@ async def authorize_payment(
             }
         )
     return final_response
+
+@app.post("/api/v1/enroll")
+async def enroll_card(payload: EnrollRequest):
+    """
+    Înrolează un card fizic și generează DPAN + HMAC key + JWT pentru Android.
+    Accesibil EXCLUSIV prin NGINX port 8443 (TLS, fără mTLS).
+
+    SECURITATE CRITICĂ:
+      - CVV NU apare în log-uri, NU se stochează, NU se transmite plain text
+      - K_user NU apare în log-uri
+      - PAN-ul complet este mascat în log-uri (doar primele 6 cifre / IIN)
+    """
+    iin = payload.pan[:6]
+    logger.info(
+        f"Cerere enroll primită (IIN: {iin})",
+        extra={"event_type": "ENROLL_REQUEST"}
+    )
+
+    # 1. Determină banca din prefix PAN
+    bank = find_bank(payload.pan)
+    if not bank:
+        logger.warning(
+            f"Bancă necunoscută pentru IIN: {iin}",
+            extra={"event_type": "ENROLL_FAILED", "reason": "UNSUPPORTED_BANK"}
+        )
+        raise HTTPException(status_code=400, detail={"error_code": "UNSUPPORTED_BANK"})
+    bank_url, bank_id = bank
+
+    # 2. Calculează cvv_hash = SHA256(pan + cvv) — CVV-ul plain text NU circulă pe rețea
+    cvv_hash = hashlib.sha256((payload.pan + payload.cvv).encode()).hexdigest()
+
+    # 3. Verifică cardul în Issuing Bank (cu cvv_hash, nu CVV plain text)
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            verify_resp = await client.post(
+                f"{bank_url}/api/v1/admin/verify-card",
+                json={
+                    "pan": payload.pan,
+                    "expiry_month": payload.expiry_month,
+                    "expiry_year": payload.expiry_year,
+                    "cvv_hash": cvv_hash
+                }
+            )
+        if verify_resp.status_code != 200:
+            logger.warning(
+                "Verificare card eșuată la Issuing Bank",
+                extra={"event_type": "ENROLL_FAILED", "reason": "INVALID_CARD_DATA"}
+            )
+            raise HTTPException(status_code=400, detail={"error_code": "INVALID_CARD_DATA"})
+    except httpx.TimeoutException:
+        logger.error(
+            "Timeout la verificarea cardului",
+            extra={"event_type": "ENROLL_FAILED", "reason": "BANK_TIMEOUT"}
+        )
+        raise HTTPException(status_code=503, detail={"error_code": "BANK_TIMEOUT"})
+
+    # 4. Generează DPAN
+    dpan = f"TKN-{uuid.uuid4().hex[:16].upper()}"
+
+    # 5. Derivă K_user din HMAC(K_master, device_id)
+    #    Același utilizator pe telefoane diferite → chei diferite (bound to device)
+    k_master_hex = os.getenv(f"BANK_{bank_id}_HMAC_KEY", "")
+    if not k_master_hex:
+        logger.error(
+            f"BANK_{bank_id}_HMAC_KEY lipsă din configurație",
+            extra={"event_type": "ENROLL_FAILED", "reason": "CONFIG_ERROR"}
+        )
+        raise HTTPException(status_code=503, detail={"error_code": "SERVICE_UNAVAILABLE"})
+
+    try:
+        k_master = bytes.fromhex(k_master_hex)
+        k_user = hmac.new(k_master, payload.device_id.encode("utf-8"), hashlib.sha256).hexdigest()
+    except ValueError:
+        logger.error(
+            f"BANK_{bank_id}_HMAC_KEY invalid (format hex incorect)",
+            extra={"event_type": "ENROLL_FAILED", "reason": "CONFIG_ERROR"}
+        )
+        raise HTTPException(status_code=503, detail={"error_code": "SERVICE_UNAVAILABLE"})
+
+    # 6. Înregistrează DPAN în TSP
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            tsp_resp = await client.post(
+                "http://tsp:8002/api/v1/tokens/register",
+                json={"dpan": dpan, "pan": payload.pan, "risk_level": 0}
+            )
+        if tsp_resp.status_code != 200:
+            logger.error(
+                "Înregistrare token în TSP eșuată",
+                extra={"event_type": "ENROLL_FAILED", "reason": "TSP_ERROR"}
+            )
+            raise HTTPException(status_code=503, detail={"error_code": "TSP_ERROR"})
+    except httpx.TimeoutException:
+        logger.error(
+            "Timeout la înregistrarea token-ului în TSP",
+            extra={"event_type": "ENROLL_FAILED", "reason": "TSP_TIMEOUT"}
+        )
+        raise HTTPException(status_code=503, detail={"error_code": "TSP_TIMEOUT"})
+
+    # 7. Citește cheia publică RSA a băncii (distribuită la Android)
+    bank_pub_key_path = f"/app/certs/bank_{bank_id.lower()}_public.pem"
+    try:
+        with open(bank_pub_key_path, "rb") as f:
+            bank_pub_key_pem = f.read()
+    except FileNotFoundError:
+        logger.error(
+            f"Cheie publică bancă lipsă: {bank_pub_key_path}",
+            extra={"event_type": "ENROLL_FAILED", "reason": "MISSING_BANK_KEY"}
+        )
+        raise HTTPException(status_code=503, detail={"error_code": "SERVICE_UNAVAILABLE"})
+
+    # 8. Generează JWT + stochează în Redis pentru invalidare viitoare
+    jwt_token = create_jwt(dpan)
+    jwt_expire = datetime.now(timezone.utc) + timedelta(days=JWT_TTL_DAYS)
+
+    if redis_client:
+        try:
+            await redis_client.setex(f"jwt:{dpan}", JWT_TTL_DAYS * 86400, "active")
+        except Exception as e:
+            logger.warning(
+                f"Nu s-a putut stoca JWT în Redis: {e}",
+                extra={"event_type": "ENROLL_REDIS_WARN"}
+            )
+
+    logger.info(
+        f"Enroll reușit pentru DPAN={dpan}, bank={bank_id}, device={payload.device_id}",
+        extra={"event_type": "ENROLL_SUCCESS"}
+    )
+
+    return {
+        "dpan": dpan,
+        "hmac_key_hex": k_user,         # K_user — NU se logează niciodată
+        "jwt_token": jwt_token,
+        "jwt_expires_at": jwt_expire.isoformat(),
+        "biometric_threshold_ron": 10000,
+        "bank_public_key_pem_b64": base64.b64encode(bank_pub_key_pem).decode()
+    }
+
+
+@app.get("/api/v1/accounts/balance")
+async def get_account_balance(authorization: Optional[str] = Header(None)):
+    """
+    Returnează soldul contului Android.
+    Autentificare: Authorization: Bearer <jwt_token>
+    Accesibil EXCLUSIV prin NGINX port 8443.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "MISSING_TOKEN", "message": "Header Authorization: Bearer <token> lipsă."}
+        )
+    token = authorization.split(" ")[1]
+    dpan = verify_jwt(token)
+
+    # Verifică dacă JWT expiră în < 30 zile (pentru refresh automat)
+    decoded = jose_jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    exp = datetime.fromtimestamp(decoded["exp"], tz=timezone.utc)
+    days_remaining = (exp - datetime.now(timezone.utc)).days
+
+    # Detokenizare DPAN → PAN via TSP
+    try:
+        async with httpx.AsyncClient(timeout=0.3) as client:
+            tsp_resp = await client.post(
+                "http://tsp:8002/api/v1/tokens/detokenize",
+                json={"dpan": dpan}
+            )
+        if tsp_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail={"error_code": "INVALID_TOKEN"})
+        pan = tsp_resp.json()["pan"]
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=503, detail={"error_code": "TSP_TIMEOUT"})
+
+    # Determină banca
+    bank = find_bank(pan)
+    if not bank:
+        raise HTTPException(status_code=400, detail={"error_code": "UNSUPPORTED_BANK"})
+    bank_url, bank_id = bank
+
+    # Preia soldul de la Issuing Bank
+    try:
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            bal_resp = await client.get(
+                f"{bank_url}/api/v1/admin/balance",
+                params={"pan": pan}
+            )
+        if bal_resp.status_code != 200:
+            raise HTTPException(status_code=503, detail={"error_code": "BALANCE_UNAVAILABLE"})
+        bal_data = bal_resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=503, detail={"error_code": "BANK_TIMEOUT"})
+
+    # Refresh JWT automat dacă mai sunt < 30 zile
+    new_token = None
+    jwt_refreshed = False
+    if days_remaining < 30:
+        new_token = create_jwt(dpan)
+        jwt_refreshed = True
+        if redis_client:
+            try:
+                await redis_client.setex(f"jwt:{dpan}", JWT_TTL_DAYS * 86400, "active")
+            except Exception:
+                pass
+
+    return {
+        "balance_ron": bal_data["balance_ron"],
+        "dpan_masked": f"TKN-****{dpan[-4:]}",
+        "bank_id": bank_id,
+        "jwt_refreshed": jwt_refreshed,
+        "new_jwt_token": new_token
+    }
+
+
+@app.get("/api/v1/transactions/history")
+async def get_transaction_history(authorization: Optional[str] = Header(None)):
+    """
+    Returnează istoricul tranzacțiilor pentru Android.
+    Autentificare: Authorization: Bearer <jwt_token>
+    Accesibil EXCLUSIV prin NGINX port 8443.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "MISSING_TOKEN", "message": "Header Authorization: Bearer <token> lipsă."}
+        )
+    token = authorization.split(" ")[1]
+    dpan = verify_jwt(token)
+
+    # Detokenizare DPAN → PAN via TSP
+    try:
+        async with httpx.AsyncClient(timeout=0.3) as client:
+            tsp_resp = await client.post(
+                "http://tsp:8002/api/v1/tokens/detokenize",
+                json={"dpan": dpan}
+            )
+        if tsp_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail={"error_code": "INVALID_TOKEN"})
+        pan = tsp_resp.json()["pan"]
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=503, detail={"error_code": "TSP_TIMEOUT"})
+
+    # Determină banca
+    bank = find_bank(pan)
+    if not bank:
+        raise HTTPException(status_code=400, detail={"error_code": "UNSUPPORTED_BANK"})
+    bank_url, bank_id = bank
+
+    # Preia tranzacțiile de la Issuing Bank (filtrate după PAN)
+    try:
+        async with httpx.AsyncClient(timeout=0.5) as client:
+            txn_resp = await client.get(
+                f"{bank_url}/api/v1/admin/transactions",
+                params={"pan": pan}
+            )
+        if txn_resp.status_code != 200:
+            raise HTTPException(status_code=503, detail={"error_code": "TRANSACTIONS_UNAVAILABLE"})
+        txn_data = txn_resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=503, detail={"error_code": "BANK_TIMEOUT"})
+
+    return {
+        "transactions": [
+            {
+                "transaction_id": t["transaction_id"],
+                "amount_ron": t.get("amount", 0) / 100,
+                "currency": t.get("currency", "RON"),
+                "status": t.get("status", "UNKNOWN"),
+                "risk_score": t.get("risk_score", 0),
+                "terminal_id": t.get("terminal_id", "UNKNOWN"),
+                "timestamp": t.get("timestamp", "")
+            }
+            for t in txn_data.get("transactions", [])
+        ]
+    }
+
 
 @app.post("/api/pki/renew")
 async def renew_certificate(

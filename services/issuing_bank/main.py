@@ -15,12 +15,14 @@ import os
 import json
 import re
 import uuid
+import hmac
+import hashlib
 import logging
 import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
@@ -218,6 +220,12 @@ class ChallengeRequest(BaseModel):
     idempotency_key: str = Field(..., description="Cheie nouă de idempotență pentru challenge")
     terminal_id: str = Field(..., description="ID-ul terminalului POS")
     pin_block_encrypted: str = Field(..., description="PIN Block criptat RSA-OAEP, encodat Base64")
+
+class VerifyCardRequest(BaseModel):
+    pan: str = Field(..., description="PAN-ul cardului de verificat")
+    expiry_month: str = Field(..., description="Luna de expirare (ex: '12')")
+    expiry_year: str = Field(..., description="Anul de expirare (ex: '28')")
+    cvv_hash: str = Field(..., description="SHA256(pan + cvv) — CVV-ul plain text NU se transmite niciodată")
 
 
 
@@ -535,8 +543,12 @@ async def authorize_transaction(payload: IssuingBankRequest):
             )
 
             if not account:
+                # Auto-create: cont creat on-the-fly la primul payment.
+                # exp_month/exp_year iau DEFAULT ('12'/'28'), cvv_hash=NULL.
+                # Contul auto-creat NU poate fi înrolat via Android (cvv_hash=NULL).
                 await conn.execute(
-                    "INSERT INTO accounts (pan, balance, last_atc) VALUES ($1, 100000, -1)",
+                    """INSERT INTO accounts (pan, balance, last_atc, exp_month, exp_year)
+                       VALUES ($1, 100000, -1, '12', '28')""",
                     payload.pan
                 )
                 stored_atc = -1
@@ -614,18 +626,106 @@ async def authorize_transaction(payload: IssuingBankRequest):
 
 # --- ENDPOINT-URI ADMIN (Dashboard) ---
 
+@app.post("/api/v1/admin/verify-card")
+async def verify_card(payload: VerifyCardRequest):
+    """
+    Verifică datele unui card fizic (PAN, expiry, CVV hash).
+    Apelat exclusiv de Gateway în fluxul de enroll Android.
+    CVV-ul plain text NU circulă niciodată pe rețea — doar SHA256(pan+cvv).
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail={"error_code": "SERVICE_UNAVAILABLE"})
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT pan, exp_month, exp_year, cvv_hash
+            FROM accounts WHERE pan = $1
+        """, payload.pan)
+
+    if not row:
+        logger.warning(
+            "Verificare card eșuată — card negăsit",
+            extra={"event_type": "CARD_VERIFY_FAILED"}
+        )
+        raise HTTPException(status_code=404, detail={"error_code": "CARD_NOT_FOUND"})
+
+    if (row["exp_month"] != payload.expiry_month or
+            row["exp_year"] != payload.expiry_year):
+        logger.warning(
+            "Verificare card eșuată — date invalide",
+            extra={"event_type": "CARD_VERIFY_FAILED"}
+        )
+        raise HTTPException(status_code=400, detail={"error_code": "INVALID_CARD_DATA"})
+
+    # Comparare timing-safe pentru cvv_hash (previne timing attacks)
+    stored_hash = row["cvv_hash"] or ""
+    if not hmac.compare_digest(stored_hash, payload.cvv_hash):
+        logger.warning(
+            "Verificare card eșuată — date invalide",
+            extra={"event_type": "CARD_VERIFY_FAILED"}
+        )
+        raise HTTPException(status_code=400, detail={"error_code": "INVALID_CARD_DATA"})
+
+    pan = payload.pan
+    logger.info(
+        f"Card verificat cu succes pentru PAN mascat: {pan[:4]}****{pan[-4:]}",
+        extra={"event_type": "CARD_VERIFY_SUCCESS"}
+    )
+    return {"status": "valid", "pan_masked": f"{pan[:4]}****{pan[-4:]}"}
+
+
+@app.get("/api/v1/admin/balance")
+async def get_balance(pan: str = Query(..., description="PAN-ul contului")):
+    """
+    Returnează soldul unui cont.
+    Apelat de Gateway în fluxul balance Android (după detokenizare JWT).
+    """
+    if not db_pool:
+        raise HTTPException(status_code=503, detail={"error_code": "SERVICE_UNAVAILABLE"})
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT balance FROM accounts WHERE pan = $1", pan
+        )
+
+    if not row:
+        raise HTTPException(status_code=404, detail={"error_code": "ACCOUNT_NOT_FOUND"})
+
+    return {
+        "balance_ron": row["balance"] / 100,
+        "balance_cents": row["balance"]
+    }
+
+
 @app.get("/api/v1/admin/transactions")
-async def get_transactions():
+async def get_transactions(pan: Optional[str] = Query(None, description="Filtru opțional după PAN")):
+    """
+    Returnează istoricul tranzacțiilor.
+    Cu pan= → filtrare per card (Android history, max 20).
+    Fără pan= → toate tranzacțiile (Dashboard, max 100).
+    """
     if not db_pool:
         return {"transactions": []}
+
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT transaction_id, pan, amount, currency, status,
-                   risk_score, terminal_id, bank, created_at
-            FROM transactions
-            ORDER BY created_at DESC
-            LIMIT 100
-        """)
+        if pan:
+            rows = await conn.fetch("""
+                SELECT transaction_id, pan, amount, currency, status,
+                       risk_score, terminal_id, bank, created_at
+                FROM transactions
+                WHERE pan = $1
+                ORDER BY created_at DESC
+                LIMIT 20
+            """, pan)
+        else:
+            rows = await conn.fetch("""
+                SELECT transaction_id, pan, amount, currency, status,
+                       risk_score, terminal_id, bank, created_at
+                FROM transactions
+                ORDER BY created_at DESC
+                LIMIT 100
+            """)
+
     return {"transactions": [
         {
             "transaction_id": r["transaction_id"],

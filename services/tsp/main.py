@@ -113,6 +113,11 @@ class DetokenizeRequest(BaseModel):
     dpan: str = Field(..., description="Device PAN (token)")
     trace_id: Optional[str] = Field(None, description="Trace ID pentru corelarea log-urilor")
 
+class RegisterTokenRequest(BaseModel):
+    dpan: str = Field(..., description="Device PAN (token nou generat de Gateway)")
+    pan: str = Field(..., description="PAN real al cardului fizic")
+    risk_level: int = Field(0, description="Scorul de risc inițial al token-ului")
+
 
 # --- ENDPOINT-URI ---
 
@@ -171,6 +176,40 @@ async def detokenize(request: DetokenizeRequest):
         "risk_level": row["risk_level"],
         "status": "ACTIVE"
     }
+@app.post("/api/v1/tokens/register")
+async def register_token(request: RegisterTokenRequest):
+    """
+    Înregistrează un DPAN nou în Token Vault.
+    Apelat de Gateway în fluxul de enroll Android.
+    Folosește ON CONFLICT DO UPDATE pentru idempotență.
+    """
+    logger.info(
+        f"Înregistrare token nou pentru DPAN: {request.dpan}",
+        extra={"event_type": "TOKEN_REGISTERED"}
+    )
+
+    if not db_pool:
+        logger.error("PostgreSQL indisponibil", extra={"event_type": "DB_ERROR"})
+        raise HTTPException(status_code=503, detail={"error_code": "SERVICE_UNAVAILABLE"})
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tokens (dpan, pan, exp_month, exp_year, risk_level)
+                VALUES ($1, $2, '12', '28', $3)
+                ON CONFLICT (dpan) DO UPDATE
+                SET pan = EXCLUDED.pan, risk_level = EXCLUDED.risk_level
+            """, request.dpan, request.pan, request.risk_level)
+    except Exception as e:
+        logger.error(
+            f"Eroare la înregistrarea token-ului: {e}",
+            extra={"event_type": "TOKEN_REGISTER_FAILED"}
+        )
+        raise HTTPException(status_code=500, detail={"error_code": "DB_ERROR"})
+
+    return {"status": "registered", "dpan": request.dpan}
+
+
 # --- PORNIRE ---
 if __name__ == "__main__":
     import uvicorn

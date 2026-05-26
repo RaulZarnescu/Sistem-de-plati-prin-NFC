@@ -2,8 +2,16 @@ CREATE TABLE IF NOT EXISTS accounts (
     pan         VARCHAR(19)  PRIMARY KEY,
     balance     INTEGER      NOT NULL DEFAULT 100000 CHECK (balance >= 0),  -- Nu se permite sold negativ
     last_atc    BIGINT       NOT NULL DEFAULT -1,
+    exp_month   VARCHAR(2)   NOT NULL DEFAULT '12',
+    exp_year    VARCHAR(4)   NOT NULL DEFAULT '28',
+    cvv_hash    VARCHAR(64),  -- SHA256(pan || cvv) — NICIODATĂ plain text (PCI-DSS)
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+-- Migrare pentru baze de date existente (idempotent)
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS exp_month VARCHAR(2) DEFAULT '12';
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS exp_year VARCHAR(4) DEFAULT '28';
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cvv_hash VARCHAR(64);
 
 CREATE TABLE IF NOT EXISTS transactions (
     id              SERIAL       PRIMARY KEY,
@@ -35,9 +43,14 @@ BEFORE UPDATE OR DELETE ON transactions
 FOR EACH ROW EXECUTE FUNCTION prevent_update_delete();
 
 -- Seed accounts pentru DPANs existente
-INSERT INTO accounts (pan, balance) VALUES
-    ('4000001111111111', 100000),
-    ('5000002222222222', 100000),
-    ('5111113333333333', 100000),
-    ('4222222222222222', 100000)
-ON CONFLICT (pan) DO NOTHING;
+-- cvv_hash = SHA256(pan || '123') — CVV de test: 123 pentru toate conturile
+-- PCI-DSS: CVV NICIODATĂ stocat plain text
+INSERT INTO accounts (pan, balance, exp_month, exp_year, cvv_hash) VALUES
+    ('4000001111111111', 100000, '12', '28', '30bc5c317cc09eda99bc6c0333feaeb7f7aa2f13d35172d66fde4ee589de6d54'),
+    ('5000002222222222', 100000, '10', '27', '83f8a3cef153030b926e5f96b0b20cb60a4783bc72473c3926ec3fb9c1c29522'),
+    ('5111113333333333', 100000, '06', '29', '13e7e32081bd408620a7ccfcb45521ac5c7049bc08954c3812ee23ab201b3469'),
+    ('4222222222222222', 100000, '12', '28', 'a322ea28be32888af1341a48f1076124c50fb792eaf56042311d01d847da5ba9')
+ON CONFLICT (pan) DO UPDATE SET
+    exp_month = EXCLUDED.exp_month,
+    exp_year  = EXCLUDED.exp_year,
+    cvv_hash  = EXCLUDED.cvv_hash;

@@ -41,3 +41,6 @@ prometheus-fastapi-instrumentator==6.1.0
 
 # Cryptography — semnare CSR și manipulare certificate X.509 (PKI renewal)
 cryptography==42.0.8
+
+# python-jose — generare și verificare JWT (Android authentication)
+python-jose[cryptography]==3.3.0
