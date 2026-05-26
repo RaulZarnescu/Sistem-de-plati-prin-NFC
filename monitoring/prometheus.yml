@@ -16,8 +16,7 @@ scrape_configs:
 
   - job_name: "issuing-bank"
     static_configs:
-      - targets: ["issuing-bank:8004"]
-
-  - job_name: "issuing-bank-b"
-    static_configs:
-      - targets: ["issuing-bank-b:8006"]
+      - targets:
+          - "issuing-bank-bt:8004"
+          - "issuing-bank-bcr:8006"
+          - "issuing-bank-ing:8007"

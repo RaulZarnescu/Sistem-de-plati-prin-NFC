@@ -1,1 +1,1 @@
-﻿{"dpan":"4000000000000001","transaction":{"amount":50.00,"currency":"RON","pos_nonce":"nonce-mtls-04","terminal_timestamp":"2026-05-10T13:00:00Z"},"cryptogram":{"mac":"45cd0c6a34005a17c361513c0cf0e949acbd3a95d214edc02d8c2bda374f290f","atc":1300}}
+{"dpan":"4000000000000001","transaction":{"amount":50.00,"currency":"RON","pos_nonce":"nonce-mtls-04","terminal_timestamp":"2026-05-10T13:00:00Z"},"cryptogram":{"mac":"45cd0c6a34005a17c361513c0cf0e949acbd3a95d214edc02d8c2bda374f290f","atc":1300}}

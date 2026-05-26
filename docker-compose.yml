@@ -104,6 +104,9 @@ services:
       - .env
     networks:
       - payment-network
+    depends_on:
+      postgres-tsp:
+        condition: service_healthy
     restart: unless-stopped
     volumes:
       - ./services/tsp:/app
@@ -161,6 +164,9 @@ services:
       - .env
     networks:
       - payment-network
+    depends_on:
+      postgres-bank:
+        condition: service_healthy
     restart: unless-stopped
     volumes:
       - ./services/issuing_bank:/app
@@ -193,6 +199,9 @@ services:
       - .env
     networks:
       - payment-network
+    depends_on:
+      postgres-bank:
+        condition: service_healthy
     restart: unless-stopped
     volumes:
       - ./services/issuing_bank:/app
@@ -225,6 +234,9 @@ services:
       - .env
     networks:
       - payment-network
+    depends_on:
+      postgres-bank:
+        condition: service_healthy
     restart: unless-stopped
     volumes:
       - ./services/issuing_bank:/app
