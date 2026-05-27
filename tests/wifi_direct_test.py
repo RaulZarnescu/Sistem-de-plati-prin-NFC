@@ -536,28 +536,31 @@ class PhoneSimulator:
         atc: int,
     ) -> str:
         """
-        Formula EXACTĂ — identică cu verify_mac() din issuing-bank-bt/main.py:
+        Formula 2-step HMAC — identică cu Android CryptoUtils.kt și shared/crypto_utils.py:
 
-          session_key = k_user   (cheia master, FĂRĂ derivare per-ATC)
-          mac_input   = f"{amount_cents}|{currency}|{nonce}|{timestamp}|{atc}"
-          mac         = HMAC-SHA256(session_key, mac_input.encode("utf-8")).hexdigest()
+          Step 1: session_key = HMAC-SHA256(k_user, str(atc))
+          Step 2: mac_input   = f"{amount_cents}|{currency}|{nonce}|{timestamp}|{atc}"
+                  mac         = HMAC-SHA256(session_key, mac_input.encode("utf-8")).hexdigest()
 
-        Confirmat din codul băncii (linia ~491):
-          verify_mac(session_key=HMAC_KEY, amount_cents=..., atc=..., ...)
-        unde HMAC_KEY este cheia master nemodificată.
-
-        Dacă shared/crypto_utils.py e disponibil, calculul e delegat acestuia
-        (nu duplicăm logica — DRY principle). session_key = k_user direct.
+        Derivarea per-ATC leagă MAC-ul de tranzacția specifică — previne reutilizarea.
+        Backend-ul (issuing_bank/main.py) derivă aceeași session_key înainte de verify_mac().
         """
+        # Step 1: derivare session_key per-ATC (identic cu derive_session_key din crypto_utils.py)
+        session_key = hmac_lib.new(
+            self.k_user,
+            str(atc).encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+
         if _HAS_SHARED_CRYPTO:
-            # shared/crypto_utils.compute_mac(session_key, ...) — session_key = k_user
-            return _shared_compute_mac(self.k_user, amount_cents, currency,
+            # shared/crypto_utils.compute_mac(session_key, ...) — primeşte session_key derivată
+            return _shared_compute_mac(session_key, amount_cents, currency,
                                        nonce, timestamp, atc)
 
-        # Fallback — implementare locală identică cu shared/crypto_utils.py
+        # Fallback — implementare locală identică cu shared/crypto_utils.compute_mac
         mac_input = f"{amount_cents}|{currency}|{nonce}|{timestamp}|{atc}"
         return hmac_lib.new(
-            self.k_user,
+            session_key,
             mac_input.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -843,10 +846,13 @@ def test_06():
     assert mac_fixed and len(mac_fixed) == 64, \
         f"MAC cu valori fixe invalid (așteptat 64 chars hex): {mac_fixed!r}"
 
-    # Recalculare independentă — confirmă că formula e deterministă
+    # Recalculare independentă — confirmă că formula e deterministă (2-step identic)
+    sk_ref = hmac_lib.new(
+        HMAC_KEY_BT, str(fixed_atc).encode("utf-8"), hashlib.sha256
+    ).digest()
     mac_input_ref = f"{fixed_amount}|{fixed_currency}|{fixed_nonce}|{fixed_timestamp}|{fixed_atc}"
     mac_ref = hmac_lib.new(
-        HMAC_KEY_BT, mac_input_ref.encode("utf-8"), hashlib.sha256
+        sk_ref, mac_input_ref.encode("utf-8"), hashlib.sha256
     ).hexdigest()
     assert mac_fixed == mac_ref, \
         f"Formula MAC inconsistentă!\n  phone:   {mac_fixed}\n  ref:     {mac_ref}"
