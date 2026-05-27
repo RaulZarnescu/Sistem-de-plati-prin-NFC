@@ -106,6 +106,14 @@ ON CONFLICT (pan) DO UPDATE SET
 -- CVV-urile sunt în docs/DEMO_SCENARIOS.md — PIN-ul NU apare niciodată
 -- în fișiere SQL sau cod sursă (aceeași regulă ca CVV).
 -- ============================================================
+-- TC-13 seed — card expirat pentru testul de expirare (exp_year='20' = 2020, PIN 1234)
+INSERT INTO accounts (pan, balance, exp_month, exp_year, cvv_hash) VALUES
+    ('4000009999999999', 100000, '01', '20',
+     '0000000000000000000000000000000000000000000000000000000000000000')
+ON CONFLICT (pan) DO UPDATE SET
+    exp_month = EXCLUDED.exp_month,
+    exp_year  = EXCLUDED.exp_year;
+
 UPDATE accounts
 SET pin_hash = encode(sha256((pan || '1234')::bytea), 'hex')
 WHERE pin_hash IS NULL;

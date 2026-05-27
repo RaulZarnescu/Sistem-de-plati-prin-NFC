@@ -532,9 +532,43 @@ async def authorize_payment(
         }
     )
 
-    # --- FAIL-CLOSED: Validare Redis ---
-    # Trebuie să fie ÎNAINTEA oricărei operații Redis (blacklist, rate limiting, idempotență).
-    # Dacă Redis e jos, respingem cererea — este preferabil față de a procesa fără protecții.
+    # --- FAIL-OPEN: Verificare blacklist terminal ---
+    # Fail-open deliberat: dacă Redis e indisponibil, tranzacția continuă.
+    # mTLS este protecția primară; blacklist-ul este un strat complementar operațional.
+    if redis_client:
+        try:
+            is_blacklisted = await redis_client.sismember(
+                "revoked_terminals",
+                terminal_id
+            )
+            if is_blacklisted:
+                logger.warning(
+                    f"Terminal revocat a încercat autorizare: {terminal_id}",
+                    extra={
+                        "event_type": "TERMINAL_REVOKED",
+                        "terminal_id": terminal_id,
+                        "trace_id": idempotency_key
+                    }
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error_code": "TERMINAL_REVOKED",
+                        "message": "Terminal revocat. Contactați administratorul.",
+                        "action_required": "CONTACT_ADMIN"
+                    }
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Nu blocăm tranzacția dacă Redis e indisponibil pentru blacklist check
+            logger.warning(
+                f"Blacklist check eșuat: {e}",
+                extra={"event_type": "BLACKLIST_CHECK_FAILED", "trace_id": idempotency_key}
+            )
+
+    # --- FAIL-CLOSED: Rate Limiting + Idempotență ---
+    # Redis obligatoriu pentru aceste verificări de securitate.
     if not redis_client:
         logger.error("Redis indisponibil. Respingere cerere (Fail-Closed).", extra={"event_type": "FAIL_CLOSED"})
         raise HTTPException(
@@ -547,22 +581,6 @@ async def authorize_payment(
             }
         )
     try:
-        # Blacklist Redis — revocarea operațională (complement la revocarea PKI)
-        is_revoked = await redis_client.sismember("revoked_terminals", terminal_id)
-        if is_revoked:
-            logger.warning(
-                f"Terminal revocat a încercat conexiunea: {terminal_id}",
-                extra={"event_type": "REVOKED_TERMINAL_BLOCKED", "terminal_id": terminal_id}
-            )
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error_code": "TERMINAL_REVOKED",
-                    "message": "Terminal dezactivat. Contactați suportul.",
-                    "action_required": "CONTACT_SUPPORT"
-                }
-            )
-        
         # --- PASUL 2: Rate Limiting (Sliding Window Log per terminal) ---
         # Sliding Window elimină problema Fixed Window (granița secundei).
         # ZADD + ZREMRANGEBYSCORE + ZCARD = atomic via pipeline.
@@ -688,7 +706,15 @@ async def authorize_payment(
                     "action_required": "USE_DIFFERENT_CARD"
                 }
             )
-            
+
+        if tsp_response.status_code == 403:
+            tsp_detail = tsp_response.json().get("detail", {})
+            logger.warning(
+                f"TSP a returnat 403: {tsp_detail.get('error_code', 'UNKNOWN')}",
+                extra={"event_type": "TOKEN_SUSPENDED", "trace_id": idempotency_key, "terminal_id": terminal_id}
+            )
+            raise HTTPException(status_code=403, detail=tsp_detail)
+
         tsp_response.raise_for_status()
         
         tsp_data = tsp_response.json()
@@ -863,7 +889,7 @@ async def authorize_payment(
     return final_response
 
 @app.post("/api/v1/enroll")
-async def enroll_card(payload: EnrollRequest):
+async def enroll_card(request: Request, payload: EnrollRequest):
     """
     Înrolează un card fizic și generează DPAN + HMAC key + JWT pentru Android.
     Accesibil EXCLUSIV prin NGINX port 8443 (TLS, fără mTLS).
@@ -945,7 +971,8 @@ async def enroll_card(payload: EnrollRequest):
         async with httpx.AsyncClient(timeout=2.0) as client:
             tsp_resp = await client.post(
                 "http://tsp:8002/api/v1/tokens/register",
-                json={"dpan": dpan, "pan": payload.pan, "risk_level": 0}
+                json={"dpan": dpan, "pan": payload.pan, "risk_level": 0,
+                      "device_id": payload.device_id}
             )
         if tsp_resp.status_code != 200:
             logger.error(
@@ -959,6 +986,25 @@ async def enroll_card(payload: EnrollRequest):
             extra={"event_type": "ENROLL_FAILED", "reason": "TSP_TIMEOUT"}
         )
         raise HTTPException(status_code=503, detail={"error_code": "TSP_TIMEOUT"})
+
+    # Audit trail enrollment (non-critic — eșecul INSERT nu blochează înrolarea)
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(
+                "http://tsp:8002/api/v1/enrollments/log",
+                json={
+                    "dpan": dpan,
+                    "pan_masked": f"{payload.pan[:4]}{'*' * 8}{payload.pan[-4:]}",
+                    "device_id": payload.device_id,
+                    "bank_id": bank_id,
+                    "ip_address": request.client.host if request.client else None
+                }
+            )
+    except Exception as e:
+        logger.warning(
+            f"Audit enrollment eșuat (non-critic): {e}",
+            extra={"event_type": "ENROLL_AUDIT_FAILED"}
+        )
 
     # 7. Citește cheia publică RSA a băncii (distribuită la Android)
     bank_pub_key_path = f"/app/certs/bank_{bank_id.lower()}_public.pem"
@@ -1233,6 +1279,57 @@ async def renew_certificate(
         "valid_days": 30,
         "issued_at": now.isoformat()
     }
+
+
+class TerminalBlacklistRequest(BaseModel):
+    terminal_id: str
+    action: str  # ADD / REMOVE
+
+@app.post("/api/v1/admin/terminals/blacklist")
+async def manage_terminal_blacklist(
+    payload: TerminalBlacklistRequest
+):
+    """
+    Adaugă sau elimină un terminal din blacklist.
+    Efect imediat — toate cererile următoare ale terminalului sunt respinse cu 403.
+    """
+    if payload.action not in ("ADD", "REMOVE"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "INVALID_ACTION",
+                "message": "Action valid: ADD sau REMOVE"
+            }
+        )
+
+    if not redis_client:
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "SERVICE_UNAVAILABLE"}
+        )
+
+    if payload.action == "ADD":
+        await redis_client.sadd("revoked_terminals", payload.terminal_id)
+        logger.warning(
+            f"Terminal adăugat în blacklist: {payload.terminal_id}",
+            extra={"event_type": "TERMINAL_BLACKLISTED"}
+        )
+        return {
+            "terminal_id": payload.terminal_id,
+            "status": "BLACKLISTED",
+            "effect": "immediate"
+        }
+    else:
+        await redis_client.srem("revoked_terminals", payload.terminal_id)
+        logger.info(
+            f"Terminal eliminat din blacklist: {payload.terminal_id}",
+            extra={"event_type": "TERMINAL_UNBLACKLISTED"}
+        )
+        return {
+            "terminal_id": payload.terminal_id,
+            "status": "ACTIVE",
+            "effect": "immediate"
+        }
 
 
 # --- PORNIRE ---

@@ -19,7 +19,8 @@ import hmac
 import hashlib
 import logging
 import math
-from datetime import datetime, timezone
+import calendar
+from datetime import datetime, timezone, date
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Query
@@ -254,6 +255,43 @@ async def challenge_payment(payload: ChallengeRequest):
                     "message": "Cheie RSA indisponibilă"}
         )
 
+    # PIN Retry Limiting — cheie per transaction_id (nu per PAN)
+    # INCR atomic garantează thread-safety între workeri multipli
+    pin_attempts_key = f"pin_attempts:{payload.transaction_id}"
+    if redis_client:
+        try:
+            attempts = await redis_client.incr(pin_attempts_key)
+            if attempts == 1:
+                await redis_client.expire(pin_attempts_key, 300)
+            if attempts > 3:
+                logger.warning(
+                    f"PIN blocat — {attempts} încercări pentru "
+                    f"tranzacția {payload.transaction_id}",
+                    extra={"event_type": "PIN_BLOCKED", "trace_id": trace_id}
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error_code": "PIN_BLOCKED",
+                        "message": "Prea multe încercări PIN. Tranzacție anulată.",
+                        "action_required": "CONTACT_BANK",
+                        "attempts_used": int(attempts),
+                        "max_attempts": 3
+                    }
+                )
+            logger.info(
+                f"Încercare PIN {attempts}/3 pentru "
+                f"tranzacția {payload.transaction_id}",
+                extra={"event_type": "PIN_ATTEMPT", "trace_id": trace_id}
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"Redis indisponibil pentru PIN retry limiting: {e}",
+                extra={"event_type": "REDIS_ERROR", "trace_id": trace_id}
+            )
+
     # Decriptare PIN Block
     try:
         encrypted_bytes = base64.b64decode(payload.pin_block_encrypted)
@@ -391,6 +429,17 @@ async def challenge_payment(payload: ChallengeRequest):
             }
         )
 
+    # PIN corect — șterge counter-ul retry (tranzacție finalizată cu succes)
+    if redis_client:
+        try:
+            await redis_client.delete(pin_attempts_key)
+        except Exception:
+            pass
+    logger.info(
+        "PIN corect. Counter retry șters.",
+        extra={"event_type": "PIN_CORRECT", "trace_id": trace_id}
+    )
+
     # PIN corect — aprobăm tranzacția Step-Up
     logger.info(
         "PIN verificat cu succes.",
@@ -513,7 +562,7 @@ async def authorize_transaction(payload: IssuingBankRequest):
     # 3. Adaugă tranzacția curentă
     pipe.zadd(velocity_key, {str(now_ts): now_ts})
     # 4. TTL de curățare — 20 minute (dublu față de fereastră)
-    pipe.expire(velocity_key, 1200)
+    pipe.expire(velocity_key, 30 * 86400)
     _, velocity, _, _ = await pipe.execute()
 
     n1 = min(velocity / 5.0, 1.0)
@@ -563,7 +612,7 @@ async def authorize_transaction(payload: IssuingBankRequest):
         "score": str(new_accumulated),
         "timestamp": now.isoformat()
     })
-    await redis_client.expire(risk_key, 86400 * 7)  # TTL 7 zile
+    await redis_client.expire(risk_key, 86400 * 30)  # TTL 30 zile
 
     logger.info(
         f"Fraud scored. Decay base: {decayed_base:.1f}, Velocity: +{velocity_contribution:.1f} (T={velocity}), "
@@ -635,7 +684,7 @@ async def authorize_transaction(payload: IssuingBankRequest):
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             account = await conn.fetchrow(
-                "SELECT pan, balance, last_atc FROM accounts WHERE pan = $1 FOR UPDATE",
+                "SELECT pan, balance, last_atc, exp_month, exp_year FROM accounts WHERE pan = $1 FOR UPDATE",
                 payload.pan
             )
 
@@ -650,9 +699,41 @@ async def authorize_transaction(payload: IssuingBankRequest):
                 )
                 stored_atc = -1
                 current_balance = 100000
+                acc_exp_month = '12'
+                acc_exp_year = '28'
             else:
                 stored_atc = account["last_atc"]
                 current_balance = account["balance"]
+                acc_exp_month = account["exp_month"]
+                acc_exp_year = account["exp_year"]
+
+            # Verificare expirare card
+            # NOTĂ: exp_year stocat ca 2 cifre ("28" = 2028), valabil până în 2099
+            try:
+                exp_year_full = int("20" + acc_exp_year)
+                exp_month_int = int(acc_exp_month)
+                last_day = calendar.monthrange(exp_year_full, exp_month_int)[1]
+                expiry_date = date(exp_year_full, exp_month_int, last_day)
+                if date.today() > expiry_date:
+                    logger.warning(
+                        f"Card expirat. Expiry: {exp_month_int}/{exp_year_full}",
+                        extra={"event_type": "CARD_EXPIRED", "trace_id": trace_id}
+                    )
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error_code": "CARD_EXPIRED",
+                            "message": "Cardul a expirat.",
+                            "action_required": "USE_DIFFERENT_CARD"
+                        }
+                    )
+            except HTTPException:
+                raise
+            except (ValueError, TypeError) as e:
+                logger.error(
+                    f"Eroare parsare dată expirare: {e}",
+                    extra={"event_type": "DB_ERROR", "trace_id": trace_id}
+                )
 
             # Validare ATC
             if received_atc <= stored_atc:

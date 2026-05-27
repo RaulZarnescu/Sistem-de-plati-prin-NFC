@@ -117,6 +117,7 @@ class RegisterTokenRequest(BaseModel):
     dpan: str = Field(..., description="Device PAN (token nou generat de Gateway)")
     pan: str = Field(..., description="PAN real al cardului fizic")
     risk_level: int = Field(0, description="Scorul de risc inițial al token-ului")
+    device_id: Optional[str] = None
 
 
 # --- ENDPOINT-URI ---
@@ -146,7 +147,7 @@ async def detokenize(request: DetokenizeRequest):
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT pan, exp_month, exp_year, risk_level FROM tokens WHERE dpan = $1",
+            "SELECT pan, exp_month, exp_year, risk_level, status FROM tokens WHERE dpan = $1",
             request.dpan
         )
 
@@ -163,6 +164,20 @@ async def detokenize(request: DetokenizeRequest):
             }
         )
 
+    if row["status"] != "ACTIVE":
+        logger.warning(
+            f"Token suspendat/revocat: {request.dpan}",
+            extra={"event_type": "TOKEN_SUSPENDED", "trace_id": trace_id}
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_code": "TOKEN_SUSPENDED",
+                "message": "Token suspendat sau revocat.",
+                "action_required": "RE_ENROLL"
+            }
+        )
+
     pan = row["pan"]
     logger.info(
         f"Token rezolvat cu succes în PAN: {pan}",
@@ -174,7 +189,7 @@ async def detokenize(request: DetokenizeRequest):
         "exp_month": row["exp_month"],
         "exp_year": row["exp_year"],
         "risk_level": row["risk_level"],
-        "status": "ACTIVE"
+        "status": row["status"]
     }
 @app.post("/api/v1/tokens/register")
 async def register_token(request: RegisterTokenRequest):
@@ -194,12 +209,39 @@ async def register_token(request: RegisterTokenRequest):
 
     try:
         async with db_pool.acquire() as conn:
+            active_count = await conn.fetchval("""
+                SELECT COUNT(*) FROM tokens
+                WHERE pan = $1 AND status = 'ACTIVE'
+            """, request.pan)
+
+            if active_count >= 5:
+                logger.warning(
+                    "Limită dispozitive atinsă pentru PAN mascat.",
+                    extra={"event_type": "MAX_DEVICES_REACHED"}
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error_code": "MAX_DEVICES_REACHED",
+                        "message": "Maximum 5 dispozitive per card.",
+                        "active_devices": int(active_count)
+                    }
+                )
+
             await conn.execute("""
-                INSERT INTO tokens (dpan, pan, exp_month, exp_year, risk_level)
-                VALUES ($1, $2, '12', '28', $3)
+                INSERT INTO tokens
+                    (dpan, pan, exp_month, exp_year,
+                     risk_level, device_id, status, enrolled_at)
+                VALUES ($1, $2, '12', '28', $3, $4, 'ACTIVE', NOW())
                 ON CONFLICT (dpan) DO UPDATE
-                SET pan = EXCLUDED.pan, risk_level = EXCLUDED.risk_level
-            """, request.dpan, request.pan, request.risk_level)
+                SET pan = EXCLUDED.pan,
+                    risk_level = EXCLUDED.risk_level,
+                    device_id = EXCLUDED.device_id,
+                    status = 'ACTIVE'
+            """, request.dpan, request.pan,
+                 request.risk_level, request.device_id)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(
             f"Eroare la înregistrarea token-ului: {e}",
@@ -207,7 +249,83 @@ async def register_token(request: RegisterTokenRequest):
         )
         raise HTTPException(status_code=500, detail={"error_code": "DB_ERROR"})
 
+    logger.info(
+        f"Token înregistrat: {request.dpan}",
+        extra={"event_type": "TOKEN_REGISTERED"}
+    )
     return {"status": "registered", "dpan": request.dpan}
+
+
+class TokenStatusUpdate(BaseModel):
+    dpan: str
+    status: str  # ACTIVE / SUSPENDED / REVOKED
+
+@app.patch("/api/v1/tokens/status")
+async def update_token_status(request: TokenStatusUpdate):
+    """
+    Permite suspendarea sau revocarea unui token compromis.
+    Utilizare: terminal furat, telefon pierdut, fraudă detectată.
+    """
+    valid_statuses = {"ACTIVE", "SUSPENDED", "REVOKED"}
+    if request.status not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": "INVALID_STATUS",
+                    "message": f"Status valid: {valid_statuses}"}
+        )
+
+    if not db_pool:
+        raise HTTPException(503, {"error_code": "SERVICE_UNAVAILABLE"})
+
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE tokens SET status = $1 WHERE dpan = $2
+        """, request.status, request.dpan)
+
+    if result == "UPDATE 0":
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "TOKEN_NOT_FOUND"}
+        )
+
+    logger.info(
+        f"Token {request.dpan} → {request.status}",
+        extra={"event_type": "TOKEN_STATUS_UPDATED"}
+    )
+    return {
+        "dpan": request.dpan,
+        "new_status": request.status,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+
+class EnrollmentLogRequest(BaseModel):
+    dpan: str
+    pan_masked: str
+    device_id: Optional[str] = None
+    bank_id: str
+    ip_address: Optional[str] = None
+
+@app.post("/api/v1/enrollments/log")
+async def log_enrollment(request: EnrollmentLogRequest):
+    if not db_pool:
+        return {"status": "skipped"}
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO enrollments
+                    (dpan, pan_masked, device_id,
+                     bank_id, ip_address)
+                VALUES ($1, $2, $3, $4, $5)
+            """,
+                request.dpan, request.pan_masked,
+                request.device_id, request.bank_id,
+                request.ip_address
+            )
+        return {"status": "logged"}
+    except Exception as e:
+        logger.error(f"Eroare audit enrollment: {e}")
+        return {"status": "failed"}
 
 
 # --- PORNIRE ---

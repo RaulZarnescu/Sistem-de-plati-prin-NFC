@@ -198,7 +198,7 @@ def main():
     tc02_body = None       # folosit în TC-07
 
     # ----------------------------------------------------------
-    print("\n📡 [0/12] Conectivitate Gateway")
+    print("\n📡 [0/14] Conectivitate Gateway")
     run_test(
         "TC-00  Health Check",
         "get", f"{GATEWAY_URL}/health",
@@ -209,7 +209,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n💳 [1/12] Happy path — Visa (Bank A, prefix 4)")
+    print("\n💳 [1/14] Happy path — Visa (Bank A, prefix 4)")
     ts1, nonce1, atc1 = now_iso(), unique_nonce(), tc01_atc  # atc1 == tc01_atc
     mac1 = compute_mac(HMAC_KEY_A, 15000, "RON", nonce1, ts1, atc1)
     run_test(
@@ -228,7 +228,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n💳 [2/12] Happy path — Mastercard (Bank B, prefix 5)")
+    print("\n💳 [2/14] Happy path — Mastercard (Bank B, prefix 5)")
     ts2, nonce2 = now_iso(), unique_nonce()  # atc2 definit în _atc_base block de sus
     mac2 = compute_mac(HMAC_KEY_B, 5000, "RON", nonce2, ts2, atc2)
     tc02_idemp_key = unique_key()
@@ -249,7 +249,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🔐 [3/12] Step-Up Authentication (risk_level=55, Bank A)")
+    print("\n🔐 [3/14] Step-Up Authentication (risk_level=55, Bank A)")
     ts3, nonce3 = now_iso(), unique_nonce()  # atc3 definit în _atc_base block de sus
     mac3 = compute_mac(HMAC_KEY_A, 10000, "RON", nonce3, ts3, atc3)
     run_test(
@@ -268,7 +268,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🚨 [4/12] MAC tampered — sumă alterată de atacator")
+    print("\n🚨 [4/14] MAC tampered — sumă alterată de atacator")
     # Atacatorul calculează MAC pentru 1 ban (amount=1)
     # dar trimite suma reală de 999 RON (amount=99900) în body.
     # Banca recalculează MAC cu 99900 → nepotrivire → INVALID_CRYPTOGRAM
@@ -290,7 +290,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🔄 [5/12] ATC Replay Attack (același ATC ca TC-01)")
+    print("\n🔄 [5/14] ATC Replay Attack (același ATC ca TC-01)")
     # Banca a stocat last_atc=tc01_atc după TC-01.
     # Trimitem din nou același ATC → received_atc <= stored_atc → REPLAY DETECTED.
     # TC-04 NU avansează ATC-ul (MAC eșua înainte de ATC check).
@@ -312,7 +312,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n❓ [6/12] DPAN necunoscut în Token Vault")
+    print("\n❓ [6/14] DPAN necunoscut în Token Vault")
     ts6, nonce6 = now_iso(), unique_nonce()
     mac6 = compute_mac(HMAC_KEY_A, 5000, "RON", nonce6, ts6, 500)
     run_test(
@@ -331,7 +331,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n♻️  [7/12] Idempotență — retrimite TC-02 (răspuns din cache)")
+    print("\n♻️  [7/14] Idempotență — retrimite TC-02 (răspuns din cache)")
     # Același idempotency key ca TC-02 → Gateway returnează răspunsul stocat în Redis
     # Body-ul poate fi identic sau diferit — idempotența e per key, nu per body
     run_test(
@@ -345,7 +345,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n⚠️  [8/12] Header X-Idempotency-Key lipsă")
+    print("\n⚠️  [8/14] Header X-Idempotency-Key lipsă")
     run_test(
         "TC-08  MISSING_IDEMPOTENCY_KEY",
         "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
@@ -362,7 +362,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n⚠️  [9/12] Header X-Terminal-Id lipsă")
+    print("\n⚠️  [9/14] Header X-Terminal-Id lipsă")
     run_test(
         "TC-09  MISSING_TERMINAL_ID",
         "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
@@ -380,7 +380,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🚦 [10/12] Rate Limiting — 3 cereri < 1s → 429 RATE_LIMIT_EXCEEDED")
+    print("\n🚦 [10/14] Rate Limiting — 3 cereri < 1s → 429 RATE_LIMIT_EXCEEDED")
     # Terminal dedicat pentru a nu interfera cu celelalte teste.
     # Gateway-ul limitează la 2 req/s per terminal (fereastră fixă pe secundă).
     rl_terminal = "POS-RATELIMIT-E2E"
@@ -423,7 +423,7 @@ def main():
     time.sleep(INTER_TEST_SLEEP)
 
     # ----------------------------------------------------------
-    print("\n🚫 [11/12] DECLINED — Fraud score > 75 (tsp_risk=90, Bank A)")
+    print("\n🚫 [11/14] DECLINED — Fraud score > 75 (tsp_risk=90, Bank A)")
     # TEST-DECLINE-001 → PAN 4444444444444444 → prefix 4 → Bank A → HMAC_KEY_A
     # Prima tranzacție pentru acest PAN: decayed_base=0, velocity=0, amount_dev=0
     # final_risk = int(min(0 + 0 + 0 + 90, 100)) = 90 > 75 → DECLINED
@@ -444,6 +444,74 @@ def main():
     )
 
     # ----------------------------------------------------------
+    print("\n🚫 [12/14] Terminal Blacklist — terminal revocat")
+    blacklist_terminal = "POS-BLACKLIST-TEST"
+
+    # Step 12a: Adaugă în blacklist
+    run_test(
+        "TC-12a Add terminal to blacklist",
+        "post", f"{GATEWAY_URL}/api/v1/admin/terminals/blacklist",
+        headers={},
+        body={"terminal_id": blacklist_terminal, "action": "ADD"},
+        expect_status=200,
+        expect_fields={"status": "BLACKLISTED"},
+    )
+    time.sleep(0.1)
+
+    # Step 12b: Tranzacție cu terminal blacklistat → 403
+    ts12, nonce12 = now_iso(), unique_nonce()
+    mac12 = compute_mac(HMAC_KEY_A, 5000, "RON", nonce12, ts12, _atc_base + 20)
+    run_test(
+        "TC-12b TERMINAL_REVOKED (blacklisted)",
+        "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
+        headers={
+            "X-Idempotency-Key": unique_key(),
+            "X-Terminal-Id": blacklist_terminal
+        },
+        body={
+            "dpan": "4000000000000001",
+            "transaction": {"amount": 5000, "currency": "RON",
+                            "pos_nonce": nonce12, "terminal_timestamp": ts12},
+            "cryptogram": {"mac": mac12, "atc": _atc_base + 20},
+        },
+        expect_status=403,
+        expect_fields={"detail.error_code": "TERMINAL_REVOKED"},
+    )
+    time.sleep(0.1)
+
+    # Step 12c: Elimină din blacklist
+    run_test(
+        "TC-12c Remove terminal from blacklist",
+        "post", f"{GATEWAY_URL}/api/v1/admin/terminals/blacklist",
+        headers={},
+        body={"terminal_id": blacklist_terminal, "action": "REMOVE"},
+        expect_status=200,
+        expect_fields={"status": "ACTIVE"},
+    )
+    time.sleep(INTER_TEST_SLEEP)
+
+    # ----------------------------------------------------------
+    print("\n💳 [13/14] Card Expired — card cu exp_year 2020")
+    # TEST-EXPIRED-001 → PAN 4000009999999999 (BT), exp_year='20' (2020)
+    # Seeded în db/init/tsp/01_schema.sql și db/init/bank/01_schema.sql.template
+    ts13, nonce13 = now_iso(), unique_nonce()
+    atc13 = _atc_base + 30
+    mac13 = compute_mac(HMAC_KEY_A, 5000, "RON", nonce13, ts13, atc13)
+    run_test(
+        "TC-13  CARD_EXPIRED",
+        "post", f"{GATEWAY_URL}/api/v1/payments/authorize",
+        headers={"X-Idempotency-Key": unique_key(), "X-Terminal-Id": TERMINAL_ID},
+        body={
+            "dpan": "TEST-EXPIRED-001",
+            "transaction": {"amount": 5000, "currency": "RON",
+                            "pos_nonce": nonce13, "terminal_timestamp": ts13},
+            "cryptogram": {"mac": mac13, "atc": atc13},
+        },
+        expect_status=400,
+        expect_fields={"detail.error_code": "CARD_EXPIRED"},
+    )
+
+    # ----------------------------------------------------------
     print("\n" + "=" * 60)
     passed_count = sum(1 for _, ok, _ in results if ok)
     total_count = len(results)
@@ -457,7 +525,7 @@ def main():
             if not ok:
                 print(f"   • {name}: {detail}")
 
-    print("\nNOTĂ: TC-12 (Fail-Closed Redis) rulează separat din PowerShell:")
+    print("\nNOTĂ: Fail-Closed Redis rulează separat din PowerShell:")
     print("  .\\tests\\redis_failover_test.ps1")
     print("=" * 60)
     exit(0 if passed_count == total_count else 1)
