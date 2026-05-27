@@ -281,7 +281,6 @@ String current_root_ca_pem;
 String g_terminalId;
 DeviceState g_deviceState = STATE_OK;
 PendingTransaction g_tx;
-String g_amountInput = ""; // cifre introduse de casier pe keypad
 unsigned long lastPkiCheckMillis =
     0; // mutat in global scope (fix eroare compilare)
 
@@ -404,14 +403,276 @@ bool isHexString(const String &value) {
 // DISPLAY TFT
 // ============================================================
 
-void showMessage(const char *line1, const char *line2) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+// 16-bit RGB565 Modern Palette
+#define COLOR_BG        0x0842  // Foarte închis, albastru-gri (Deep Slate Blue)
+#define COLOR_CARD      0x18C7  // Albastru-gri mediu închis (Sleek Card)
+#define COLOR_ACCENT    0x3DFF  // Cyan/Albastru Neon vibrant (Accent)
+#define COLOR_TEXT_MAIN 0xFFFF  // Alb pur
+#define COLOR_TEXT_MUTED 0xBDF7 // Gri deschis / muted
+#define COLOR_GREEN     0x2E66  // Verde smarald premium (Emerald Success)
+#define COLOR_RED       0xD144  // Roșu chihlimbar/stins (Crimson Error)
+#define COLOR_YELLOW    0xFDE0  // Galben chihlimbar (Amber/Gold)
+
+void drawHeaderAndFooter(const char* state_str) {
+  // Top Header
+  tft.fillRect(0, 0, 320, 30, COLOR_CARD);
+  tft.setTextColor(COLOR_ACCENT);
   tft.setTextSize(2);
-  tft.setCursor(0, 0);
+  tft.setCursor(10, 7);
+  tft.print("SECURE POS");
+
+  // WiFi status right-aligned
+  tft.setTextSize(1);
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.fillCircle(300, 15, 4, COLOR_GREEN);
+    tft.setTextColor(COLOR_TEXT_MUTED);
+    tft.setCursor(250, 11);
+    tft.print("ONLINE");
+  } else {
+    tft.fillCircle(300, 15, 4, COLOR_RED);
+    tft.setTextColor(COLOR_RED);
+    tft.setCursor(240, 11);
+    tft.print("OFFLINE");
+  }
+
+  // Divider line
+  tft.drawFastHLine(0, 30, 320, COLOR_ACCENT);
+
+  // Bottom Footer
+  tft.drawFastHLine(0, 210, 320, COLOR_CARD);
+  tft.fillRect(0, 211, 320, 29, COLOR_BG);
+  tft.setTextColor(COLOR_TEXT_MUTED);
+  tft.setTextSize(1);
+  tft.setCursor(10, 220);
+  tft.print("ID: ");
+  tft.print(g_terminalId.length() > 0 ? g_terminalId.c_str() : "POS-DEVICE");
+
+  if (state_str) {
+    tft.setCursor(220, 220);
+    tft.print(state_str);
+  }
+}
+
+void showMessage(const char *line1, const char *line2) {
+  // 1. Boot / Setup Screen
+  if (line1 && (strstr(line1, "Pornire") || strstr(line1, "WiFi") || strstr(line1, "NTP") || strstr(line1, "Cert"))) {
+    tft.fillScreen(COLOR_BG);
+    drawHeaderAndFooter("SETUP");
+    
+    tft.fillRoundRect(20, 50, 280, 140, 8, COLOR_CARD);
+    tft.drawRoundRect(20, 50, 280, 140, 8, COLOR_ACCENT);
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(2);
+    tft.setCursor(40, 80);
+    tft.print(line1);
+    
+    if (line2 && strlen(line2) > 0) {
+      tft.setTextColor(COLOR_TEXT_MUTED);
+      tft.setTextSize(1);
+      tft.setCursor(40, 120);
+      tft.print(line2);
+    }
+    
+    tft.drawRoundRect(40, 150, 240, 10, 3, COLOR_BG);
+    tft.fillRoundRect(42, 152, 120, 6, 2, COLOR_ACCENT);
+    return;
+  }
+
+  // 2. Idle State Screen
+  if (line1 && strcmp(line1, "Gata de plata") == 0) {
+    tft.fillScreen(COLOR_BG);
+    drawHeaderAndFooter("IDLE");
+    
+    tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
+    tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_ACCENT);
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(2);
+    tft.setCursor(75, 80);
+    tft.print("GATA DE PLATA");
+    
+    tft.setTextColor(COLOR_TEXT_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(45, 120);
+    tft.print("Asteptare initiere tranzactie...");
+    tft.setCursor(55, 140);
+    tft.print("Folositi dashboard-ul local");
+
+    // Card symbol
+    tft.drawRoundRect(140, 160, 40, 24, 4, COLOR_ACCENT);
+    tft.fillRect(140, 165, 40, 5, COLOR_ACCENT);
+    return;
+  }
+
+  // 3. Blocked State Screen
+  if (line1 && strcmp(line1, "Terminal BLOCAT") == 0) {
+    tft.fillScreen(COLOR_RED);
+    
+    tft.fillRoundRect(30, 40, 260, 160, 8, COLOR_BG);
+    tft.drawRoundRect(30, 40, 260, 160, 8, COLOR_RED);
+    
+    tft.setTextColor(COLOR_RED);
+    tft.setTextSize(2);
+    tft.setCursor(70, 70);
+    tft.print("TERMINAL BLOCAT");
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(1);
+    tft.setCursor(50, 115);
+    tft.print("Incalcarea securitatii detectata!");
+    tft.setCursor(60, 135);
+    tft.print("Necesita resetare manuala de");
+    tft.setCursor(70, 155);
+    tft.print("la serverul central (PKI).");
+    return;
+  }
+
+  // 4. PIN Entry Screen
+  if (line1 && (strcmp(line1, "Introdu PIN:") == 0 || strcmp(line1, "PIN necesar") == 0)) {
+    tft.fillScreen(COLOR_BG);
+    drawHeaderAndFooter("SECURITY");
+    
+    tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
+    tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_YELLOW);
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(2);
+    tft.setCursor(85, 70);
+    tft.print("INTRODU PIN");
+    
+    tft.drawRoundRect(60, 105, 200, 36, 6, COLOR_BG);
+    
+    int pin_len = 0;
+    if (line2) {
+      for (size_t i = 0; i < strlen(line2); i++) {
+        if (line2[i] == '*') pin_len++;
+      }
+    }
+    
+    int start_x = 95;
+    for (int i = 0; i < 4; i++) {
+      if (i < pin_len) {
+        tft.fillCircle(start_x + i * 40, 123, 8, COLOR_YELLOW);
+      } else {
+        tft.drawCircle(start_x + i * 40, 123, 8, COLOR_TEXT_MUTED);
+      }
+    }
+    
+    tft.setTextColor(COLOR_TEXT_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(65, 160);
+    tft.print("Confirmati introducerea cu #");
+    return;
+  }
+
+  // 5. Success Screen
+  if (line2 && strcmp(line2, "APROBAT") == 0) {
+    tft.fillScreen(COLOR_GREEN);
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(3);
+    tft.setCursor(95, 60);
+    tft.print("APROBAT");
+    
+    // Draw huge checkmark
+    tft.drawLine(120, 130, 150, 160, COLOR_TEXT_MAIN);
+    tft.drawLine(120, 131, 150, 161, COLOR_TEXT_MAIN);
+    tft.drawLine(120, 132, 150, 162, COLOR_TEXT_MAIN);
+    tft.drawLine(150, 160, 210, 90, COLOR_TEXT_MAIN);
+    tft.drawLine(150, 161, 210, 91, COLOR_TEXT_MAIN);
+    tft.drawLine(150, 162, 210, 92, COLOR_TEXT_MAIN);
+    
+    tft.setTextSize(2);
+    tft.setCursor(55, 185);
+    tft.print("Plata finalizata!");
+    return;
+  }
+
+  // 6. Declined or Error Screen
+  if (line2 && (strcmp(line2, "REFUZAT") == 0 || strstr(line2, "refuzat") || strstr(line2, "insuf") || strstr(line2, "blocat") || strstr(line2, "Eroare") || strstr(line2, "Timeout") || strstr(line2, "Err:"))) {
+    tft.fillScreen(COLOR_RED);
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(3);
+    tft.setCursor(95, 50);
+    tft.print("REFUZAT");
+    
+    tft.fillRoundRect(30, 100, 260, 90, 8, COLOR_BG);
+    tft.drawRoundRect(30, 100, 260, 90, 8, COLOR_TEXT_MAIN);
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(2);
+    int text_x = 160 - (strlen(line2) * 6);
+    tft.setCursor(text_x > 40 ? text_x : 40, 125);
+    tft.print(line2);
+    
+    tft.setTextColor(COLOR_TEXT_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(65, 165);
+    tft.print("Contactati banca emitenta");
+    return;
+  }
+
+  // 7. Transaction Amount Screen
+  bool is_amount_screen = false;
+  if (line1 && strlen(line1) > 4) {
+    if (strcmp(line1 + strlen(line1) - 3, "RON") == 0) {
+      is_amount_screen = true;
+    }
+  }
+  
+  if (is_amount_screen) {
+    tft.fillScreen(COLOR_BG);
+    drawHeaderAndFooter("PAYMENT");
+    
+    tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
+    tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_ACCENT);
+    
+    tft.setTextColor(COLOR_TEXT_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(110, 65);
+    tft.print("SUMA DE PLATA");
+    
+    tft.setTextColor(COLOR_TEXT_MAIN);
+    tft.setTextSize(3);
+    int amt_x = 160 - (strlen(line1) * 9);
+    tft.setCursor(amt_x > 30 ? amt_x : 30, 88);
+    tft.print(line1);
+    
+    if (line2 && strcmp(line2, "Procesare...") == 0) {
+      tft.fillRoundRect(40, 135, 240, 35, 6, COLOR_YELLOW);
+      tft.setTextColor(COLOR_BG);
+      tft.setTextSize(1);
+      tft.setCursor(95, 148);
+      tft.print("PROCESARE PLATA...");
+    } else {
+      tft.fillRoundRect(40, 135, 240, 35, 6, COLOR_ACCENT);
+      tft.setTextColor(COLOR_TEXT_MAIN);
+      tft.setTextSize(1);
+      int stat_x = 160 - ((line2 ? strlen(line2) : 14) * 3);
+      tft.setCursor(stat_x > 45 ? stat_x : 45, 148);
+      tft.print(line2 ? line2 : "APROPIATI TELEFONUL");
+    }
+    return;
+  }
+
+  // 8. General Info Fallback
+  tft.fillScreen(COLOR_BG);
+  drawHeaderAndFooter("INFO");
+  
+  tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
+  tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_ACCENT);
+  
+  tft.setTextColor(COLOR_TEXT_MAIN);
+  tft.setTextSize(2);
+  tft.setCursor(40, 80);
   tft.print(line1);
+  
   if (line2 && strlen(line2) > 0) {
-    tft.setCursor(0, 40);
+    tft.setTextColor(COLOR_TEXT_MUTED);
+    tft.setTextSize(1);
+    tft.setCursor(40, 120);
     tft.print(line2);
   }
 }
@@ -773,7 +1034,7 @@ cleanup_csr:
 }
 
 bool postCsrAndStoreNewCert(const String &csr_base64, const String &newKeyPem) {
-  StaticJsonDocument<512> bodyDoc;
+  JsonDocument bodyDoc;
   bodyDoc["csr_pem_b64"] = csr_base64;
   String body;
   serializeJson(bodyDoc, body);
@@ -793,7 +1054,7 @@ bool postCsrAndStoreNewCert(const String &csr_base64, const String &newKeyPem) {
   if (code != 200)
     return false;
 
-  StaticJsonDocument<1024> doc;
+  JsonDocument doc;
   if (deserializeJson(doc, resp))
     return false;
 
@@ -1060,12 +1321,20 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
 
   if (g_deviceState == STATE_BRICKED_PENDING_MANUAL_RESET) {
     showMessage("Terminal BLOCAT", "Reset necesar");
+    Serial.println("[DEBUG-AUTH] Eroare: Terminalul este blocat de securitate. Apelul de autorizare a fost anulat.");
     return;
   }
 
   // Idempotency key generat O SINGURA DATA — refolosit la fiecare retry
   String idempotencyKey = generateUuidV4();
   String terminalId = getTerminalId();
+
+  Serial.println("\n=======================================================");
+  Serial.printf("[DEBUG-AUTH] Initiere tranzactie de %d.%02d RON\n", amountCents / 100, amountCents % 100);
+  Serial.printf("[DEBUG-AUTH] Terminal ID: %s\n", terminalId.c_str());
+  Serial.printf("[DEBUG-AUTH] Idempotency Key: %s\n", idempotencyKey.c_str());
+  Serial.printf("[DEBUG-AUTH] Payload JSON:\n%s\n", payload.c_str());
+  Serial.println("=======================================================");
 
   for (int attempt = 0; attempt <= max_retries; ++attempt) {
     HTTPClient http;
@@ -1077,9 +1346,18 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
     http.addHeader("X-Terminal-Id", terminalId);
 
     showTransaction(amountCents, "Procesare...");
+    Serial.printf("[DEBUG-AUTH] [Incercarea %d/%d] Se trimite POST la %s:%d%s...\n", 
+                  attempt + 1, max_retries + 1, gateway_host, gateway_port, gateway_path);
+                  
     int httpCode = http.POST(payload);
     String body = http.getString();
-    Serial.printf("[HTTP] attempt=%d code=%d\n", attempt, httpCode);
+    
+    Serial.printf("[DEBUG-AUTH] [Incercarea %d/%d] Cod raspuns HTTP: %d\n", attempt + 1, max_retries + 1, httpCode);
+    if (httpCode > 0) {
+      Serial.printf("[DEBUG-AUTH] Corp raspuns: %s\n", body.c_str());
+    } else {
+      Serial.printf("[DEBUG-AUTH] Eroare retea / Timeout! (%s)\n", http.errorToString(httpCode).c_str());
+    }
 
     bool retryable = false;
 
@@ -1087,10 +1365,13 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       JsonDocument doc;
       DeserializationError err = deserializeJson(doc, body);
       String status = "";
-      if (!err && doc.containsKey("status"))
+      if (!err && doc["status"].is<const char*>())
         status = jsonGetString(doc["status"]);
 
+      Serial.printf("[DEBUG-AUTH] Status deserializat: %s\n", status.c_str());
+
       if (status == "APPROVED") {
+        Serial.println("[DEBUG-AUTH] Rezultat: APROBAT de Gateway. Tranzactie reusita!");
         showTransaction(amountCents, "APROBAT");
         feedbackPulse();
         http.end();
@@ -1098,8 +1379,8 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       }
 
       if (status == "DECLINED") {
-        // Incearca sa extraga motivul daca exista
         String reason = doc["detail"]["error_code"] | "";
+        Serial.printf("[DEBUG-AUTH] Rezultat: REFUZAT de Gateway. Motiv: %s\n", reason.c_str());
         if (reason == "INSUFFICIENT_FUNDS")
           showTransaction(amountCents, "Fonduri insuf.");
         else
@@ -1108,51 +1389,58 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
         return;
       }
 
-      // Caz defensiv: gateway ar putea returna 200+CHALLENGE_REQUIRED
-      // (in practica vine ca 401, dar tratam si aceasta ramura)
       if (status == "CHALLENGE_REQUIRED") {
-        // PaymentResponse este serializat flat — doc["transaction_id"]
         String tx_id = doc["transaction_id"] | "";
         String orig_dpan = doc["original_dpan"] | "";
         http.end();
 
+        Serial.printf("[DEBUG-AUTH] Rezultat: CHALLENGE_REQUIRED. Tx ID: %s\n", tx_id.c_str());
+
         if (tx_id.length() == 0 || orig_dpan.length() == 0) {
+          Serial.println("[DEBUG-AUTH] Eroare: Datele de challenge lipsesc din raspuns 200!");
           showMessage("Eroare challenge", "Date lipsa");
           return;
         }
         showMessage("PIN necesar", "Conf. cu #");
+        Serial.println("[DEBUG-AUTH] Se asteapta introducerea PIN-ului pe tastatura...");
         String pin = collectPin(PIN_MAX_DIGITS, 30000);
         if ((int)pin.length() < PIN_MIN_LENGTH) {
+          Serial.println("[DEBUG-AUTH] Timeout PIN sau PIN prea scurt!");
           showMessage("Timeout PIN", nullptr);
           return;
         }
+        
+        Serial.println("[DEBUG-AUTH] PIN colectat cu succes. Se trimite cerere challenge la gateway...");
         int challCode = sendChallengeRequestWithPin(tx_id, orig_dpan, pin);
+        Serial.printf("[DEBUG-AUTH] Cod raspuns challenge de la gateway: %d\n", challCode);
+        
         if (challCode == 200) {
+          Serial.println("[DEBUG-AUTH] Challenge REUSIT! Tranzactie aprobata.");
           showTransaction(amountCents, "APROBAT");
           feedbackPulse();
           return;
         } else if (challCode == 400) {
+          Serial.println("[DEBUG-AUTH] Challenge ESUAT: PIN incorect!");
           showMessage("PIN incorect", "Reincercati");
           return;
         } else if (challCode == 403) {
+          Serial.println("[DEBUG-AUTH] Challenge ESUAT: Card blocat!");
           showMessage("Card blocat", "Contact banca");
           return;
         } else {
           retryable = isRetryableStatus(challCode);
+          Serial.printf("[DEBUG-AUTH] Challenge eroare sistem. Retryable: %s\n", retryable ? "DA" : "NU");
           if (!retryable) {
             showTransaction(amountCents, "Eroare PIN");
             return;
           }
         }
       } else {
-        // status necunoscut in HTTP 200 — retryable daca mai sunt incercari
-        Serial.printf("[HTTP] Status necunoscut in 200: %s\n", status.c_str());
+        Serial.printf("[DEBUG-AUTH] Avertisment: Status necunoscut in HTTP 200: %s. Se incearca reincercarea tranzactiei.\n", status.c_str());
         retryable = true;
       }
 
     } else if (httpCode == 401) {
-      // CHALLENGE_REQUIRED: FastAPI serializeaza HTTPException ca
-      // {"detail": {"error_code": "...", "transaction_id": "...", ...}}
       JsonDocument doc;
       DeserializationError err = deserializeJson(doc, body);
 
@@ -1167,30 +1455,45 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       }
       http.end();
 
+      Serial.printf("[DEBUG-AUTH] HTTP 401 primiti: CHALLENGE_REQUIRED. Tx ID: %s, DPAN: ...%s\n", 
+                    transaction_id.c_str(), 
+                    original_dpan.substring(max(0, (int)original_dpan.length() - 4)).c_str());
+
       if (transaction_id.length() == 0 || original_dpan.length() == 0) {
+        Serial.println("[DEBUG-AUTH] Eroare: Datele de challenge lipsesc in raspunsul 401!");
         showMessage("Eroare 401", "Date lipsa");
         return;
       }
       showMessage("PIN necesar", "Conf. cu #");
+      Serial.println("[DEBUG-AUTH] Se asteapta introducerea PIN-ului pe tastatura...");
       String pin = collectPin(PIN_MAX_DIGITS, 30000);
       if ((int)pin.length() < PIN_MIN_LENGTH) {
+        Serial.println("[DEBUG-AUTH] Timeout PIN sau PIN prea scurt!");
         showMessage("Timeout PIN", nullptr);
         return;
       }
+      
+      Serial.println("[DEBUG-AUTH] PIN colectat. Se trimite cererea de challenge la gateway...");
       int challCode =
           sendChallengeRequestWithPin(transaction_id, original_dpan, pin);
+      Serial.printf("[DEBUG-AUTH] Cod raspuns challenge de la gateway: %d\n", challCode);
+      
       if (challCode == 200) {
+        Serial.println("[DEBUG-AUTH] Challenge REUSIT! Tranzactie aprobata.");
         showTransaction(amountCents, "APROBAT");
         feedbackPulse();
         return;
       } else if (challCode == 400) {
+        Serial.println("[DEBUG-AUTH] Challenge ESUAT: PIN incorect!");
         showMessage("PIN incorect", "Reincercati");
         return;
       } else if (challCode == 403) {
+        Serial.println("[DEBUG-AUTH] Challenge ESUAT: Card blocat!");
         showMessage("Card blocat", "Contact banca");
         return;
       } else {
         retryable = isRetryableStatus(challCode);
+        Serial.printf("[DEBUG-AUTH] Challenge eroare. Retryable: %s\n", retryable ? "DA" : "NU");
         if (!retryable) {
           showTransaction(amountCents, "Eroare PIN");
           return;
@@ -1198,10 +1501,10 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       }
 
     } else if (httpCode == 400) {
-      // Erori definitive — NU face retry
       JsonDocument doc;
       deserializeJson(doc, body);
       String errCode = doc["detail"]["error_code"] | "UNKNOWN";
+      Serial.printf("[DEBUG-AUTH] Eroare definitiva HTTP 400: %s\n", errCode.c_str());
       if (errCode == "INSUFFICIENT_FUNDS")
         showTransaction(amountCents, "Fonduri insuf.");
       else if (errCode == "INVALID_CRYPTOGRAM")
@@ -1212,15 +1515,17 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       return;
 
     } else if (httpCode == 403) {
+      Serial.println("[DEBUG-AUTH] Eroare definitiva HTTP 403: Card blocat!");
       showMessage("Card blocat", "Contact banca");
       http.end();
       return;
 
     } else if (isRetryableStatus(httpCode)) {
-      // 429 RATE_LIMIT sau 503 IDEMPOTENCY_STORE_DOWN
+      Serial.printf("[DEBUG-AUTH] Eroare tranzitorie / temporara: %d. Este posibila reincercarea.\n", httpCode);
       retryable = true;
 
     } else {
+      Serial.printf("[DEBUG-AUTH] Eroare sistem necunoscuta: %d. Corp raspuns: %s\n", httpCode, body.c_str());
       showTransaction(amountCents, "Eroare sistem");
       http.end();
       return;
@@ -1229,6 +1534,7 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
     http.end();
 
     if (!retryable || attempt == max_retries) {
+      Serial.println("[DEBUG-AUTH] S-au epuizat incercarile sau eroarea nu permite reincercarea.");
       showTransaction(amountCents, "Eroare sistem");
       return;
     }
@@ -1237,7 +1543,7 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
     char buf[32];
     snprintf(buf, sizeof(buf), "Retry %ds", wait / 1000);
     showTransaction(amountCents, buf);
-    Serial.printf("[HTTP] backoff %d ms (attempt %d)\n", wait, attempt);
+    Serial.printf("[DEBUG-AUTH] Reincercare in %d ms (Incercarea %d terminata)\n", wait, attempt + 1);
     delay(wait);
   }
 
@@ -1250,7 +1556,7 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
 
 bool sendNfcCommand(const uint8_t *command, uint8_t commandLen,
                     uint8_t *response, uint8_t *responseLength) {
-  return nfc.inDataExchange(command, commandLen, response, responseLength);
+  return nfc.inDataExchange(const_cast<uint8_t*>(command), commandLen, response, responseLength);
 }
 
 bool appendTlv(uint8_t *buffer, int &offset, uint8_t tag, const uint8_t *value,
@@ -1288,11 +1594,67 @@ bool buildEmvGpoPayload(int amountCents, const String &currency,
 // ============================================================
 // SERVER HTTP LOCAL — WiFi Direct
 //
+// POST /initiate         ← dashboard trimite amount_cents; ESP32 creeaza tranzactia
 // GET  /payment-request  → trimite datele tranzactiei active la telefon
 // POST /payment-response ← primeste DPAN + ATC + MAC de la telefon
 // ============================================================
 
 void setupLocalServer() {
+  // POST /initiate
+  // Dashboard-ul (sau aplicatia) initiaza o tranzactie noua cu suma dorita.
+  // Body JSON: {"amount_cents": 1500, "currency": "RON"}  (currency optional)
+  // Raspuns: {"status":"OK","pos_nonce":"...","terminal_timestamp":"...","terminal_id":"..."}
+  localServer.on(
+      "/initiate", HTTP_POST, [](AsyncWebServerRequest *request) {},
+      nullptr,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len,
+         size_t index, size_t total) {
+        if (g_tx.state != POS_IDLE) {
+          request->send(409, "application/json",
+                        "{\"error\":\"Transaction already in progress\"}");
+          return;
+        }
+
+        JsonDocument doc;
+        if (deserializeJson(doc, data, len)) {
+          request->send(400, "application/json",
+                        "{\"error\":\"Invalid JSON\"}");
+          return;
+        }
+
+        int amountCents = doc["amount_cents"] | -1;
+        String currency = doc["currency"] | "RON";
+
+        if (amountCents <= 0) {
+          request->send(400, "application/json",
+                        "{\"error\":\"amount_cents must be > 0\"}");
+          return;
+        }
+
+        g_tx.amountCents = amountCents;
+        g_tx.currency = currency;
+        g_tx.posNonce = generatePosNonce();
+        g_tx.terminalTimestamp = getIsoTimestamp();
+        g_tx.state = POS_WAITING_FOR_PHONE;
+        g_tx.stateEnteredAt = millis();
+
+        Serial.printf("[POS] Tranzactie initiata din dashboard: %d.%02d RON"
+                      " | Nonce: %s | Timp: %s\n",
+                      g_tx.amountCents / 100, g_tx.amountCents % 100,
+                      g_tx.posNonce.c_str(), g_tx.terminalTimestamp.c_str());
+
+        showTransaction(g_tx.amountCents, "Apropiati tel.");
+
+        JsonDocument resp;
+        resp["status"] = "OK";
+        resp["pos_nonce"] = g_tx.posNonce;
+        resp["terminal_timestamp"] = g_tx.terminalTimestamp;
+        resp["terminal_id"] = getTerminalId();
+        String body;
+        serializeJson(resp, body);
+        request->send(200, "application/json", body);
+      });
+
   // GET /payment-request
   // Telefonul polleaza acest endpoint pana primeste status PENDING
   localServer.on(
@@ -1398,12 +1760,11 @@ void setup() {
   tft.setRotation(1);
   showMessage("Pornire...", nullptr);
 
-  // Initializare NVS
+  // Initializare NVS — curățăm și resetăm spațiul pentru a preveni NOT_ENOUGH_SPACE
   prefs.begin("pki", false);
-  if (!prefs.isKey(RENEW_FAILURES_NVS_KEY))
-    prefs.putInt(RENEW_FAILURES_NVS_KEY, 0);
-  if (!prefs.isKey(STATE_NVS_KEY))
-    prefs.putInt(STATE_NVS_KEY, STATE_OK);
+  prefs.clear(); // Eliberează tot spațiul fragmentat în namespace-ul pki
+  prefs.putInt(RENEW_FAILURES_NVS_KEY, 0);
+  prefs.putInt(STATE_NVS_KEY, STATE_OK);
   prefs.end();
   g_deviceState = loadDeviceState();
 
@@ -1457,29 +1818,15 @@ void setup() {
   else
     Serial.println("[NTP] AVERTISMENT: Timp nesincronizat");
 
-  // Incarcare certificate mTLS (din NVS sau fallback la PEM-urile hardcodate)
-  String loadedCert, loadedKey;
-  if (loadClientCredentialsFromNVS(loadedCert, loadedKey)) {
-    current_client_cert_pem = loadedCert;
-    current_client_key_pem = loadedKey;
-    Serial.println("[mTLS] Certificate incarcate din NVS");
-  } else {
-    current_client_cert_pem = String(client_cert_pem);
-    current_client_key_pem = String(client_key_pem);
-    if (storeClientCredentialsToNVS(current_client_cert_pem,
-                                    current_client_key_pem)) {
-      Serial.println("[mTLS] Certificate stocate in NVS");
-    }
-  }
+  // Întotdeauna suprascriem NVS cu certificatele proaspăt compiled pentru a asigura sincronizarea cu CA/Gateway-ul din Docker.
+  current_client_cert_pem = String(client_cert_pem);
+  current_client_key_pem = String(client_key_pem);
+  storeClientCredentialsToNVS(current_client_cert_pem, current_client_key_pem);
+  Serial.println("[mTLS] Certificate proaspete stocate si fortate in NVS");
 
-  String loadedRootCa;
-  if (loadRootCaFromNVS(loadedRootCa)) {
-    current_root_ca_pem = loadedRootCa;
-    Serial.println("[mTLS] CA incarcat din NVS");
-  } else {
-    current_root_ca_pem = String(root_ca_pem);
-    storeRootCaToNVS(current_root_ca_pem);
-  }
+  current_root_ca_pem = String(root_ca_pem);
+  storeRootCaToNVS(current_root_ca_pem);
+  Serial.println("[mTLS] CA proaspat stocat si fortat in NVS");
 
   // Configureaza mTLS pe WiFiClientSecure
   secureClient.setCACert(current_root_ca_pem.c_str());
@@ -1507,16 +1854,16 @@ void setup() {
     setupLocalServer();
   }
 
-  showMessage("Introduceti suma:", "---");
-  Serial.println("[POS] Gata. Introduceti suma pe keypad si apasati #\n");
+  showMessage("Gata de plata", "Asteptati...");
+  Serial.println("[POS] Gata. Asteptam tranzactie din dashboard pe POST /initiate\n");
 }
 
 // ============================================================
 // LOOP PRINCIPAL — State Machine WiFi Direct
 //
 // STATE 0 POS_IDLE:
-//   Casierul introduce suma pe keypad (cifre = RON, # = confirma, * = sterg)
-//   La confirmare → POS_WAITING_FOR_PHONE
+//   Ecranul afiseaza "Gata de plata". Tranzactia este initiata extern
+//   prin POST /initiate de la dashboard → POS_WAITING_FOR_PHONE
 //
 // STATE 1 POS_WAITING_FOR_PHONE:
 //   ESP32 expune datele tranzactiei pe GET /payment-request
@@ -1559,7 +1906,7 @@ void loop() {
       setupLocalServer();
       delay(1000);
       if (g_tx.state == POS_IDLE)
-        showMessage("Introduceti suma:", "---");
+        showMessage("Gata de plata", "Asteptati...");
     } else {
       Serial.println("[WiFi] Reconectare esuata");
       showMessage("WiFi EROARE", "Verifica AP");
@@ -1568,60 +1915,10 @@ void loop() {
     }
   }
 
-  // ── STATE 0: IDLE — introducere suma ──────────────────────
+  // ── STATE 0: IDLE — asteptam tranzactie din dashboard ────────
+  // Tranzactia este initiata exclusiv prin POST /initiate de la dashboard.
+  // Keypad-ul este rezervat doar pentru PIN in fluxul de challenge.
   if (g_tx.state == POS_IDLE) {
-    char key = keypad.getKey();
-    if (!key) {
-      delay(50);
-      return;
-    }
-
-    if (key >= '0' && key <= '9') {
-      if (g_amountInput.length() < 6) // max 999999 RON
-        g_amountInput += key;
-    } else if (key == '*') {
-      // Backspace
-      if (g_amountInput.length() > 0)
-        g_amountInput.remove(g_amountInput.length() - 1);
-    } else if (key == '#') {
-      // Confirmare suma
-      if (g_amountInput.length() == 0) {
-        delay(50);
-        return;
-      }
-      long amountRon = g_amountInput.toInt();
-      if (amountRon <= 0) {
-        showMessage("Suma invalida", "Reintroduceti");
-        g_amountInput = "";
-        delay(1500);
-        showMessage("Introduceti suma:", "---");
-        return;
-      }
-
-      g_tx.amountCents = (int)(amountRon * 100);
-      g_tx.currency = "RON";
-      g_tx.posNonce = generatePosNonce();
-      g_tx.terminalTimestamp = getIsoTimestamp();
-      g_tx.state = POS_WAITING_FOR_PHONE;
-      g_tx.stateEnteredAt = millis();
-      g_amountInput = "";
-
-      showTransaction(g_tx.amountCents, "Apropiati tel.");
-      Serial.printf("[POS] Tranzactie initiata: %d.%02d RON"
-                    " | Nonce: %s | Timp: %s\n",
-                    g_tx.amountCents / 100, g_tx.amountCents % 100,
-                    g_tx.posNonce.c_str(), g_tx.terminalTimestamp.c_str());
-      return;
-    }
-
-    // Actualizeaza display cu suma curenta
-    if (g_amountInput.length() > 0) {
-      char buf[32];
-      snprintf(buf, sizeof(buf), "%s RON", g_amountInput.c_str());
-      showMessage("Suma:", buf);
-    } else {
-      showMessage("Introduceti suma:", "---");
-    }
     delay(50);
     return;
   }
@@ -1633,7 +1930,7 @@ void loop() {
       g_tx = PendingTransaction{};
       showMessage("Timeout", "Reincercati");
       delay(2000);
-      showMessage("Introduceti suma:", "---");
+      showMessage("Gata de plata", "Asteptati...");
     }
     // Telefonul va face POST /payment-response via AsyncWebServer
     // care va trece state-ul in POS_PROCESSING
@@ -1645,16 +1942,16 @@ void loop() {
   if (g_tx.state == POS_PROCESSING) {
     // Construieste payload JSON identic cu cel din fluxul NFC
     // (dpan, atc, mac vin de la telefon; restul generat local)
-    StaticJsonDocument<512> doc;
+    JsonDocument doc;
     doc["dpan"] = g_tx.dpan;
 
-    JsonObject transaction = doc.createNestedObject("transaction");
+    JsonObject transaction = doc["transaction"].to<JsonObject>();
     transaction["amount"] = g_tx.amountCents;
     transaction["currency"] = g_tx.currency;
     transaction["pos_nonce"] = g_tx.posNonce;
     transaction["terminal_timestamp"] = g_tx.terminalTimestamp;
 
-    JsonObject cryptogram = doc.createNestedObject("cryptogram");
+    JsonObject cryptogram = doc["cryptogram"].to<JsonObject>();
     cryptogram["mac"] = g_tx.mac;
     cryptogram["atc"] = g_tx.atc;
 
@@ -1665,7 +1962,7 @@ void loop() {
 
     delay(3000);
     g_tx = PendingTransaction{}; // reset la IDLE
-    showMessage("Introduceti suma:", "---");
+    showMessage("Gata de plata", "Asteptati...");
     return;
   }
 

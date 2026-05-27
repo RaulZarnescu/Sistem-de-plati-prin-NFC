@@ -92,6 +92,24 @@ def get_nested(data: dict, dot_path: str):
     return node
 
 
+def reset_fraud_state(pan: str) -> None:
+    """Șterge cheile Redis de fraudă pentru a reseta riscul velocity."""
+    try:
+        import redis
+        redis_pw = os.getenv("REDIS_PASSWORD", "")
+        r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "redis-master"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            password=redis_pw if redis_pw else None,
+            decode_responses=True,
+        )
+        keys = [f"velocity:{pan}", f"risk:{pan}", f"amounts:{pan}"]
+        r.delete(*keys)
+        r.close()
+    except Exception as e:
+        print(f"      [WARNING] Failed to reset fraud state in Redis: {e}")
+
+
 # ============================================================
 # TEST RUNNER
 # ============================================================
@@ -183,6 +201,14 @@ def preflight():
 
 def main():
     preflight()
+
+    # Reset all test card fraud states in Redis to ensure a clean slate for the test run
+    print("\n🧹 Cleaning Redis fraud states for all test cards...")
+    reset_fraud_state("4000001111111111")
+    reset_fraud_state("5000002222222222")
+    reset_fraud_state("4222222222222222")
+    reset_fraud_state("4444444444444444")
+    print("  ✅ Redis clean-up complete.")
 
     # ATC-uri bazate pe timestamp Unix — garantat crescătoare între rulări succesive.
     # Redis persistă ATC-urile (AOF), deci rularea 2 cu aceiași ATC statici (100, 200)
@@ -291,6 +317,8 @@ def main():
 
     # ----------------------------------------------------------
     print("\n🔄 [5/14] ATC Replay Attack (același ATC ca TC-01)")
+    # Reset fraud state in Redis to avoid triggering CHALLENGE_REQUIRED due to high velocity
+    reset_fraud_state("4000001111111111")
     # Banca a stocat last_atc=tc01_atc după TC-01.
     # Trimitem din nou același ATC → received_atc <= stored_atc → REPLAY DETECTED.
     # TC-04 NU avansează ATC-ul (MAC eșua înainte de ATC check).

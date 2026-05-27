@@ -5,8 +5,11 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import List
+import logging
 import os
 import httpx
+
+logger = logging.getLogger("dashboard")
 
 load_dotenv()
 
@@ -70,7 +73,8 @@ async def esp32_status():
             "status": "online",
             "esp32_state": r.json().get("status", "UNKNOWN")
         }
-    except Exception:
+    except Exception as e:
+        logger.warning("ESP32 offline (GET /payment-request → %s): %s", ESP32_BASE_URL, e)
         return {"status": "offline"}
 
 
@@ -97,8 +101,8 @@ async def pos_initiate(request: POSInitiateRequest):
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.post(
-                f"{ESP32_BASE_URL}/initiate-transaction",
-                json={"amount_cents": amount_cents, "items": items_detail}
+                f"{ESP32_BASE_URL}/initiate",
+                json={"amount_cents": amount_cents, "currency": "RON"}
             )
         if resp.status_code == 409:
             return JSONResponse(
@@ -106,12 +110,13 @@ async def pos_initiate(request: POSInitiateRequest):
                 content={"error": "Tranzacție deja în curs",
                          "hint": "Așteptați finalizarea tranzacției curente"}
             )
-    except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError):
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
+        logger.warning("ESP32 indisponibil (POST /initiate → %s): %s", ESP32_BASE_URL, e)
         return JSONResponse(
             status_code=503,
             content={
                 "error": "ESP32 indisponibil",
-                "hint": "Verifică că simulatorul ESP32 rulează"
+                "hint": f"Verifică că ESP32 este pornit și accesibil la {ESP32_BASE_URL}"
             }
         )
 
@@ -158,7 +163,8 @@ async def pos_status():
 
         return {"status": "IDLE"}
 
-    except Exception:
+    except Exception as e:
+        logger.warning("ESP32 offline la polling status (GET /payment-request → %s): %s", ESP32_BASE_URL, e)
         return {"status": "ESP32_OFFLINE"}
 
 
@@ -504,6 +510,11 @@ function handlePollResult(data, btn, origHTML) {
   } else if (s === 'ESP32_OFFLINE') {
     stopPolling();
     showStatus('st-err', '❌ ESP32 deconectat', 'Conexiunea cu terminalul s-a pierdut.');
+    btn.innerHTML = origHTML; btn.disabled = cart.length === 0;
+
+  } else if (s === 'IDLE') {
+    stopPolling();
+    showStatus('st-err', '❌ EXPIRAT', 'Timpul de plată a expirat. Terminalul a revenit în IDLE.');
     btn.innerHTML = origHTML; btn.disabled = cart.length === 0;
   }
 }
