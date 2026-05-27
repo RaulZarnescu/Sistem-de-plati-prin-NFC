@@ -16,6 +16,28 @@ import hashlib
 from datetime import datetime, timezone
 
 
+def derive_session_key(master_key: bytes, atc: int) -> bytes:
+    """
+    Pasul 1 din formula 2-step HMAC (aliniat cu Android CryptoUtils.kt):
+      Session_Key = HMAC-SHA256(master_key, str(atc))
+
+    Această derivare leagă cheia de sesiune de tranzacția specifică (ATC),
+    prevenind reutilizarea cheii între tranzacții.
+
+    Parametri:
+        master_key : Cheia master HMAC a băncii emitente (bytes, 32 bytes)
+        atc        : Application Transaction Counter (int)
+
+    Returnează:
+        Session key ca bytes (32 bytes pentru SHA256)
+    """
+    return hmac.new(
+        key=master_key,
+        msg=str(atc).encode("utf-8"),
+        digestmod=hashlib.sha256
+    ).digest()
+
+
 def compute_mac(
     session_key: bytes,
     amount_cents: int,

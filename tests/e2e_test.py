@@ -65,9 +65,16 @@ INTER_TEST_SLEEP = 0.6  # secunde
 
 def compute_mac(key: bytes, amount_cents: int, currency: str,
                 pos_nonce: str, terminal_timestamp: str, atc: int) -> str:
-    """Replicăm exact formula din shared/crypto_utils.py."""
+    """
+    Replicăm exact formula 2-step din shared/crypto_utils.py + Android CryptoUtils.kt:
+      Step 1: Session_Key = HMAC-SHA256(master_key, str(atc))
+      Step 2: MAC = HMAC-SHA256(Session_Key, mac_input)
+    """
+    session_key = hmac_lib.new(
+        key, str(atc).encode("utf-8"), hashlib.sha256
+    ).digest()
     mac_input = f"{amount_cents}|{currency}|{pos_nonce}|{terminal_timestamp}|{atc}"
-    return hmac_lib.new(key, mac_input.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac_lib.new(session_key, mac_input.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def now_iso() -> str:

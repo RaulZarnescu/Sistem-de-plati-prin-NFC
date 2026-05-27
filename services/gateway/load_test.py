@@ -10,23 +10,24 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from shared.crypto_utils import compute_mac
+from shared.crypto_utils import compute_mac, derive_session_key
 
 def amount_to_cents(amount: float) -> int:
     return int(round(amount * 100))
 
 load_dotenv()
 
-key_a = bytes.fromhex(os.getenv('ISSUING_BANK_HMAC_MASTER_KEY', ''))
-key_b = bytes.fromhex(os.getenv('ISSUING_BANK_B_HMAC_MASTER_KEY', ''))
+key_a = bytes.fromhex(os.getenv('BANK_BT_HMAC_KEY') or os.getenv('ISSUING_BANK_HMAC_MASTER_KEY', ''))
+key_b = bytes.fromhex(os.getenv('BANK_BCR_HMAC_KEY') or os.getenv('ISSUING_BANK_B_HMAC_MASTER_KEY', ''))
+key_c = bytes.fromhex(os.getenv('BANK_ING_HMAC_KEY', ''))
 
 URL = "http://localhost:8001/api/v1/payments/authorize"
 
 dpans = [
-    ("4000000000000001", key_a),  # Bank A, valid TSP
-    ("TEST-STEP-UP-001", key_a),  # Bank A, valid TSP, risk=55
-    ("5000000000000001", key_b),  # Bank B, valid TSP
-    ("5000000000000002", key_b),  # Bank B, valid TSP
+    ("4000000000000001", key_a),  # BT,  Visa
+    ("TEST-STEP-UP-001", key_a),  # BT,  Visa, risk=55
+    ("5000000000000002", key_b),  # BCR, Mastercard
+    ("5000000000000003", key_c),  # ING, Mastercard
 ]
 
 terminals = ["POS-BETA-01", "POS-BETA-02", "POS-BETA-03", "POS-BETA-04", "POS-BETA-05"]
@@ -49,7 +50,8 @@ async def send_request(client, req_id):
     if random.random() < 0.1:
         mac = "INVALID_MAC"
     else:
-        mac = compute_mac(key, amount_cents, "RON", nonce, ts, atc)
+        session_key = derive_session_key(key, atc)
+        mac = compute_mac(session_key, amount_cents, "RON", nonce, ts, atc)
 
     body = {
         "dpan": dpan,

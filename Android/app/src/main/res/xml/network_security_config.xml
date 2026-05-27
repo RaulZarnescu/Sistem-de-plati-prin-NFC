@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Configurare pentru comunicare cu server-ul de pe laptop (self-signed cert).
+        Instalează CA-ul self-signed pe telefon (Settings → Security → Install certificate)
+        sau adaugă cert-ul în res/raw/server_ca.crt și activează linia de mai jos.
+    -->
+    <!--
+        Cleartext permis global pentru mediu de cercetare pe rețea locală controlată.
+        În producție: înlocuiți ws:// cu wss:// și setați cleartextTrafficPermitted="false".
+    -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

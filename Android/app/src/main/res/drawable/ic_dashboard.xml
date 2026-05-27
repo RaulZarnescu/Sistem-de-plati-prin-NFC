@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- Top-left tile -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M3,3 h8 v8 H3 z"
+        android:fillAlpha="1"/>
+
+    <!-- Top-right tile -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M13,3 h8 v8 H13 z"
+        android:fillAlpha="1"/>
+
+    <!-- Bottom-left tile -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M3,13 h8 v8 H3 z"
+        android:fillAlpha="1"/>
+
+    <!-- Bottom-right tile (narrower — list icon feel) -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M13,13 h8 v8 H13 z"
+        android:fillAlpha="1"/>
+
+</vector>

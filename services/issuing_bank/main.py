@@ -40,7 +40,7 @@ BANK_PRIVATE_KEY = None
 redis_client: Optional[aioredis.Redis] = None
 db_pool: Optional[asyncpg.Pool] = None
 
-from shared.crypto_utils import verify_mac, verify_pin
+from shared.crypto_utils import verify_mac, verify_pin, derive_session_key
 
 load_dotenv()
 
@@ -486,9 +486,12 @@ async def authorize_transaction(payload: IssuingBankRequest):
     # 1. Extragem datele pentru calculul HMAC
     amount_cents = payload.transaction.amount
     
-    # 2. Verificăm MAC-ul (AC-02)
+    # 2. Verificăm MAC-ul (AC-02) — formula 2-step HMAC (aliniată cu Android + ESP32)
+    #    Step 1: Session_Key = HMAC-SHA256(K_master, str(ATC))
+    #    Step 2: verify MAC = HMAC-SHA256(Session_Key, mac_input)
+    session_key = derive_session_key(HMAC_KEY, payload.cryptogram.atc)
     is_valid_mac = verify_mac(
-        session_key=HMAC_KEY,
+        session_key=session_key,
         amount_cents=amount_cents,
         currency=payload.transaction.currency,
         pos_nonce=payload.transaction.pos_nonce,
