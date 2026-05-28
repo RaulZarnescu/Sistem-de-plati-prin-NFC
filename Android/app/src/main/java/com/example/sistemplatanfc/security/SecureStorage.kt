@@ -11,8 +11,10 @@ import java.util.UUID
  *   - DPAN (Device PAN — tokenul de plată)
  *   - Bank Public Key (pentru PIN Block, opțional)
  *   - Biometric Threshold (prag confirmare biometrică, în cenți)
- *   - Auth Token JWT
+ *   - Auth Token JWT + data expirării
  *   - Device ID
+ *   - Server IP (IP-ul laptopului cu Docker)
+ *   - POS IP (IP-ul ESP32)
  *
  * Folosește EncryptedSharedPreferences (AES-256-GCM), cu cheia de criptare
  * generată și protejată în Android Hardware-Backed Keystore.
@@ -82,6 +84,16 @@ class SecureStorage(context: Context) {
 
     fun isLoggedIn(): Boolean = getAuthToken() != null
 
+    /**
+     * FIX #4: Stochează data expirării JWT (ISO 8601).
+     * Folosit pentru a detecta expirarea și a re-înrola cardului.
+     */
+    fun storeJwtExpiry(expiresAt: String) =
+        prefs.edit().putString("jwt_expires_at", expiresAt).apply()
+
+    fun getJwtExpiry(): String? =
+        prefs.getString("jwt_expires_at", null)
+
     // ─── Device ID ────────────────────────────────────────────────────────────
 
     fun getDeviceId(): String {
@@ -93,7 +105,20 @@ class SecureStorage(context: Context) {
         return deviceId
     }
 
-    // ─── POS IP (Wi-Fi payment) ───────────────────────────────────────────────
+    // ─── Server IP (laptop cu Docker) ─────────────────────────────────────────
+
+    /**
+     * FIX #5: IP-ul laptopului cu Docker (backend).
+     * Configurat de utilizator la prima rulare sau din ecranul de setări.
+     * Format: "192.168.X.Y" (fără port sau protocol)
+     */
+    fun storeServerIp(ip: String) =
+        prefs.edit().putString("server_ip", ip).apply()
+
+    fun getServerIp(): String? =
+        prefs.getString("server_ip", null)
+
+    // ─── POS IP (ESP32 — WiFi Direct) ─────────────────────────────────────────
 
     fun storePosIp(ip: String) = plainPrefs.edit().putString("pos_ip", ip).apply()
     fun getPosIp(): String? = plainPrefs.getString("pos_ip", null)

@@ -1,18 +1,35 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
+
     <!--
-        Configurare pentru comunicare cu server-ul de pe laptop (self-signed cert).
-        Instalează CA-ul self-signed pe telefon (Settings → Security → Install certificate)
-        sau adaugă cert-ul în res/raw/server_ca.crt și activează linia de mai jos.
+        Backend HTTPS (laptop cu Docker) — strict, fără cleartext.
+        CA-ul self-signed al proiectului e inclus în trust-anchors.
+        Fișier: Android/app/src/main/res/raw/ca_cert.crt
+                (copiat din certs/ca.crt)
     -->
-    <!--
-        Cleartext permis global pentru mediu de cercetare pe rețea locală controlată.
-        În producție: înlocuiți ws:// cu wss:// și setați cleartextTrafficPermitted="false".
-    -->
-    <base-config cleartextTrafficPermitted="true">
+    <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
-            <certificates src="user" />
+            <!--
+                CA-ul intern al proiectului (self-signed).
+                Dacă fișierul lipsește, HTTPS la backend va eșua cu SSLHandshakeException.
+                Copiați certs/ca.crt → Android/app/src/main/res/raw/ca_cert.crt
+            -->
+            <certificates src="@raw/ca_cert" />
         </trust-anchors>
     </base-config>
+
+    <!--
+        ESP32 (192.168.101.67) — HTTP plain permis (WiFi Direct, rețea locală).
+        ESP32 nu are certificate TLS → cleartext necesar.
+        Portul implicit: 8088 (ESP32_PORT din .env)
+
+        TODO: Dacă ESP32 primește alt IP (DHCP), actualizați această adresă.
+        TODO: Când modulul NFC e reinstalat și ESP32 implementează HTTPS,
+              această excepție cleartext poate fi eliminată.
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.101.67</domain>
+    </domain-config>
+
 </network-security-config>

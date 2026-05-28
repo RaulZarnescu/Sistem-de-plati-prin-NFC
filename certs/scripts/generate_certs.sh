@@ -19,12 +19,24 @@ openssl req -new \
     -key $CERTS_DIR/gateway.key \
     -out $CERTS_DIR/gateway.csr \
     -subj "/C=RO/O=FictiveBank/CN=payment-gateway"
+
+# SAN config — IMPORTANT: mbedTLS 2.x pe ESP32 face hostname verification
+# cu mbedtls_ssl_set_hostname("192.168.101.11") si cauta DOAR in DNS SANs,
+# NU in IP SANs. De aceea adaugam IP-ul si ca DNS SAN.
+cat > $CERTS_DIR/gateway_san.cnf << EOF
+[v3_ext]
+subjectAltName = DNS:payment-gateway, DNS:localhost, DNS:192.168.101.11, IP:192.168.101.11
+EOF
+
 openssl x509 -req -days 365 \
     -in $CERTS_DIR/gateway.csr \
     -CA $CERTS_DIR/ca.crt \
     -CAkey $CERTS_DIR/ca.key \
     -CAcreateserial \
+    -extfile $CERTS_DIR/gateway_san.cnf \
+    -extensions v3_ext \
     -out $CERTS_DIR/gateway.crt
+
 
 echo "=== 3. Certificat terminal POS de test ==="
 openssl genrsa -out $CERTS_DIR/pos-buc-001.key 2048

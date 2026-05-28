@@ -55,9 +55,17 @@ def reset_fraud_state(pan: str) -> None:
     print(f"  [Redis] Reset stare fraudă pentru {pan[:4]}****{pan[-4:]} ({deleted} chei șterse)")
 
 
+def derive_session_key(master_key: bytes, atc: int) -> bytes:
+    return hmac_lib.new(
+        key=master_key,
+        msg=str(atc).encode("utf-8"),
+        digestmod=hashlib.sha256
+    ).digest()
+
 def compute_mac(key, amount_cents, currency, nonce, timestamp, atc):
+    session_key = derive_session_key(key, atc)
     mac_input = f"{amount_cents}|{currency}|{nonce}|{timestamp}|{atc}"
-    return hmac_lib.new(key, mac_input.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac_lib.new(session_key, mac_input.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def load_public_key(path: str):

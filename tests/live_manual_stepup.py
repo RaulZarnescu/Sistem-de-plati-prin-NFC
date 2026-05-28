@@ -26,20 +26,44 @@ import time
 import hmac as hmac_lib
 import hashlib
 import uuid
-import httpx
-import redis
 from datetime import datetime, timezone
+
+# Verificare dependențe
+try:
+    import redis
+except ImportError:
+    print("❌ Lipsește pachetul 'redis'.")
+    print("   Instalează cu: pip install redis")
+    sys.exit(1)
+
+try:
+    import httpx
+except ImportError:
+    print("❌ Lipsește pachetul 'httpx'.")
+    print("   Instalează cu: pip install httpx")
+    sys.exit(1)
 
 # Configurații
 ESP32_URL = "http://192.168.101.67"
-BANK_BT_API = "http://nfc-issuing-bank-bt:8004"
+BANK_BT_API = os.getenv(
+    "BANK_BT_API_URL",
+    "http://localhost:8004"
+)
 PAN = "4000001111111111"
 DPAN = "TEST-STEP-UP-BT"
 
+def derive_session_key(master_key: bytes, atc: int) -> bytes:
+    return hmac_lib.new(
+        key=master_key,
+        msg=str(atc).encode("utf-8"),
+        digestmod=hashlib.sha256
+    ).digest()
+
 def compute_mac(key: bytes, amount_cents: int, currency: str,
                 pos_nonce: str, terminal_timestamp: str, atc: int) -> str:
+    session_key = derive_session_key(key, atc)
     mac_input = f"{amount_cents}|{currency}|{pos_nonce}|{terminal_timestamp}|{atc}"
-    return hmac_lib.new(key, mac_input.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac_lib.new(session_key, mac_input.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def reset_fraud_state() -> None:
     """Resetează starea de fraudă în Redis pentru a garanta scor de risc stabil (exact 55)."""
@@ -185,21 +209,37 @@ def main():
     start_time = time.time()
     approved = False
     last_checked_tx_id = initial_tx_id
+    last_status_displayed = ""
+    dots = 0
 
     while time.time() - start_time < 45.0:
         status, tx_id = get_latest_transaction_status()
+
+        # Feedback la schimbarea statusului
+        if status != last_status_displayed:
+            if status == "CHALLENGE_REQUIRED":
+                print("\n  🔐 Gateway a trimis CHALLENGE_REQUIRED!")
+                print("  ⌨️  ESP32 afișează ecranul de PIN...")
+            last_status_displayed = status
+
         if tx_id != last_checked_tx_id and tx_id != initial_tx_id:
             if status == "APPROVED":
-                print(f"\n🎉 APROBAT! Tranzacția {tx_id} a fost aprobată cu succes!")
-                print("  ✅ Pe ecranul ESP32 ar trebui să apară ecranul verde cu 'APROBAT'!")
+                print(f"\n🎉 APROBAT! Tranzacția {tx_id} aprobată!")
+                print("  ✅ Ecranul ESP32 afișează verde 'APROBAT'!")
                 approved = True
                 break
             elif status == "DECLINED":
-                print(f"\n❌ REFUZAT! Tranzacția {tx_id} a fost refuzată de bancă (PIN greșit sau eroare).")
+                print(f"\n❌ REFUZAT! Tranzacția {tx_id} refuzată.")
+                print("  Verificați PIN-ul introdus (1234).")
                 break
-            elif status == "CHALLENGE_REQUIRED":
-                # Încă așteptăm
-                pass
+
+        # Feedback periodic la fiecare 5 secunde
+        elapsed = int(time.time() - start_time)
+        if elapsed > 0 and elapsed % 5 == 0 and elapsed != dots:
+            dots = elapsed
+            remaining = 45 - elapsed
+            print(f"  ⏳ Se monitorizează... ({remaining}s rămase)")
+
         time.sleep(1.0)
 
     if not approved:
@@ -212,3 +252,37 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ============================================================
+# INSTRUCȚIUNI DE RULARE
+# ============================================================
+# Prerequisite:
+#   pip install httpx redis
+#
+# Variabile de mediu necesare (din .env):
+#   BANK_BT_HMAC_KEY  — cheia HMAC pentru banca BT
+#   REDIS_HOST        — host Redis (default: redis-master)
+#   REDIS_PORT        — port Redis (default: 6379)
+#   REDIS_PASSWORD    — parola Redis
+#   BANK_BT_API_URL   — URL API bancă (default: localhost:8004)
+#
+# Rulare:
+#   # Încarcă variabilele din .env
+#   export $(cat .env | grep -v '^#' | xargs)
+#   python tests/live_manual_stepup.py
+#
+# SAU pe Windows PowerShell:
+#   Get-Content .env | ForEach-Object {
+#       if ($_ -match '^([^#][^=]*)=(.*)$') {
+#           [System.Environment]::SetEnvironmentVariable(
+#               $matches[1], $matches[2])
+#       }
+#   }
+#   python tests/live_manual_stepup.py
+#
+# Prerequisite hardware:
+#   - ESP32 pornit și conectat la rețea
+#   - ESP32_URL setat corect (IP-ul terminalului)
+#   - Docker compose up (Gateway, Redis, Bănci)
+#   - DPAN TEST-STEP-UP-BT în Token Vault cu risk_level=55
+# ============================================================

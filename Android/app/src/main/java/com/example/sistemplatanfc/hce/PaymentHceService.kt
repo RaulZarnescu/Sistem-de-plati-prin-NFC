@@ -5,7 +5,8 @@ import android.content.Intent
 import android.nfc.cardemulation.HostApduService
 import android.os.Bundle
 import android.util.Log
-import androidx.core.content.edit
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import com.example.sistemplatanfc.data.CardManager
 import com.example.sistemplatanfc.model.BankCard
 import com.example.sistemplatanfc.security.KeystoreManager
@@ -16,6 +17,14 @@ import java.nio.charset.StandardCharsets
 
 /**
  * Serviciu HCE (Host Card Emulation) — emulează un card de plată NFC.
+ *
+ * FIX #7: NFC_ENABLED = false pentru prezentare (modul PN532 defect temporar).
+ *   Codul HCE rămâne complet și funcțional — se reactivează setând NFC_ENABLED = true.
+ *
+ * FIX #6: ATC schimbat din Int la Long (BIGINT / int64 conform spec).
+ *
+ * FIX #10: ATC stocat în EncryptedSharedPreferences (nu plain SharedPreferences).
+ *   Previne manipularea ATC-ului pe telefoane rootate (replay attack).
  *
  * STATE MACHINE (4 stări):
  *
@@ -33,17 +42,27 @@ import java.nio.charset.StandardCharsets
  *
  *  STATE 4 — RĂSPUNS FINAL
  *    Android trimite: dpan|atc|mac + 90 00
- *    (Dacă biometrie necesară: răspuns asincron via sendResponseApdu)
  */
 class PaymentHceService : HostApduService() {
 
-    /** ATC persistent în SharedPreferences — supraviețuiește restart app (anti Replay Attack) */
-    private var atc: Int
-        get() = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getInt(KEY_ATC, 0)
-        set(value) = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit { putInt(KEY_ATC, value) }
+    /**
+     * ATC persistent în EncryptedSharedPreferences.
+     * FIX #6: Long în loc de Int (BIGINT).
+     * FIX #10: EncryptedSharedPreferences în loc de plain SharedPreferences.
+     */
+    private var atc: Long
+        get() = getEncryptedPrefs(this).getLong(KEY_ATC, System.currentTimeMillis())
+        set(value) = getEncryptedPrefs(this).edit().putLong(KEY_ATC, value).apply()
 
     override fun processCommandApdu(commandApdu: ByteArray?, extras: Bundle?): ByteArray? {
         if (commandApdu == null) return STATUS_FAILED
+
+        // FIX #7: NFC dezactivat — returnează SW 6A82 (File Not Found)
+        // POS va anula APDU și nu va mai trimite comenzi suplimentare.
+        if (!NFC_ENABLED) {
+            Log.d(TAG, "NFC dezactivat (modul PN532 defect). Folosiți WiFi Direct.")
+            return STATUS_FILE_NOT_FOUND
+        }
 
         val hexCommand = commandApdu.toHex()
         Log.d(TAG, "APDU primit: $hexCommand")
@@ -58,8 +77,6 @@ class PaymentHceService : HostApduService() {
             // ── STATE 2-4: PAYMENT REQUEST ──────────────────────────────────────
             hexCommand.startsWith("00A0") -> {
                 handlePaymentRequest(commandApdu)
-                // null = răspuns va veni asincron via sendResponseApdu (biometrie)
-                // non-null = răspuns sincron imediat
             }
 
             else -> {
@@ -69,13 +86,6 @@ class PaymentHceService : HostApduService() {
         }
     }
 
-    /**
-     * STATE 2: Parsează datele de plată, decide dacă biometria e necesară.
-     * STATE 3: Calculează MAC (2-step HMAC cu cheie din Keystore).
-     * STATE 4: Răspuns final dpan|atc|mac + 9000.
-     *
-     * Returnează null dacă biometria e necesară (răspuns asincron).
-     */
     private fun handlePaymentRequest(commandApdu: ByteArray): ByteArray? {
         try {
             val activeCard = CardManager.getActiveCard()
@@ -84,7 +94,6 @@ class PaymentHceService : HostApduService() {
                 return STATUS_NO_CARD
             }
 
-            // Parsare APDU: CLA(1) INS(1) P1(1) P2(1) Lc(1) Data(Lc)
             if (commandApdu.size < 6) return STATUS_FAILED
             val lc = commandApdu[4].toInt() and 0xFF
             if (commandApdu.size < (5 + lc)) return STATUS_FAILED
@@ -98,34 +107,31 @@ class PaymentHceService : HostApduService() {
 
             val amountCents = parts[0].toLong()
             val currency    = parts[1]
-            val nonce       = parts[2]   // hex uppercase 8 chars — exact cum vine de la POS
-            val timestamp   = parts[3]   // ISO 8601 UTC — exact cum vine de la POS
+            val nonce       = parts[2]
+            val timestamp   = parts[3]
 
             Log.i(TAG, "STATE 2: amount=${amountCents}c currency=$currency nonce=$nonce")
 
-            // Incrementăm ATC înainte de orice (anti replay)
-            val newAtc = atc + 1
+            // FIX #6: ATC este Long
+            val newAtc: Long = atc + 1L
             atc = newAtc
 
-            // ── STATE 2: Verificare prag biometric ────────────────────────────
             val secureStorage = SecureStorage.getInstance(this)
             val threshold = secureStorage.getBiometricThresholdCents()
 
             if (amountCents > threshold) {
                 Log.i(TAG, "Sumă ${amountCents}c > prag ${threshold}c → biometrie necesară")
 
-                // Salvăm datele pending pentru BiometricPaymentActivity
                 pendingData = PendingPayment(
-                    card       = activeCard,
-                    amountCents = amountCents.toInt(),
-                    currency   = currency,
-                    nonce      = nonce,
-                    timestamp  = timestamp,
-                    atc        = newAtc,
+                    card        = activeCard,
+                    amountCents = amountCents,
+                    currency    = currency,
+                    nonce       = nonce,
+                    timestamp   = timestamp,
+                    atc         = newAtc,
                 )
                 pendingCallback = { response -> sendResponseApdu(response) }
 
-                // Lansăm Activity pentru biometrie (async — returnăm null)
                 val intent = Intent(this, BiometricPaymentActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                     putExtra(BiometricPaymentActivity.EXTRA_AMOUNT_CENTS, amountCents)
@@ -134,21 +140,19 @@ class PaymentHceService : HostApduService() {
                 }
                 startActivity(intent)
 
-                return null  // Răspunsul va veni via sendResponseApdu din BiometricPaymentActivity
+                return null
             }
 
-            // ── STATE 3 + 4: Sumă sub prag — răspuns imediat ─────────────────
-            return buildPaymentResponse(activeCard, amountCents.toInt(), currency, nonce, timestamp, newAtc)
+            return buildPaymentResponse(activeCard, amountCents, currency, nonce, timestamp, newAtc)
 
         } catch (e: Exception) {
-            Log.e(TAG, "Eroare procesare plată: ${e.message}", e)
+            Log.e(TAG, "Eroare procesare plată NFC: ${e.message}", e)
             return STATUS_FAILED
         }
     }
 
     override fun onDeactivated(reason: Int) {
         Log.d(TAG, "Sesiune NFC închisă (reason=$reason)")
-        // Curăță pending dacă sesiunea a expirat înainte ca biometria să fie completată
         if (reason == DEACTIVATION_LINK_LOSS) {
             pendingData = null
             pendingCallback = null
@@ -157,71 +161,111 @@ class PaymentHceService : HostApduService() {
 
     companion object {
         private const val TAG        = "PaymentHceService"
-        private const val PREFS_NAME = "hce_prefs"
+        private const val PREFS_NAME = "hce_prefs_enc"  // redenumit față de "hce_prefs" plain
         private const val KEY_ATC    = "atc"
 
-        val STATUS_SUCCESS = byteArrayOf(0x90.toByte(), 0x00.toByte())
-        val STATUS_FAILED  = byteArrayOf(0x6F.toByte(), 0x00.toByte())
-        val STATUS_NO_CARD = byteArrayOf(0x6A.toByte(), 0x82.toByte())
+        /**
+         * FIX #7: Flag pentru activarea/dezactivarea NFC HCE.
+         *
+         * false = prezentare (modul PN532 defect) — plata via WiFi Direct
+         * true  = producție (modul NFC funcțional)
+         *
+         * Setați true când modulul NFC e reinstalat.
+         */
+        const val NFC_ENABLED = false
 
-        /** Date de plată pending (pentru fluxul cu biometrie async) */
+        val STATUS_SUCCESS        = byteArrayOf(0x90.toByte(), 0x00.toByte())
+        val STATUS_FAILED         = byteArrayOf(0x6F.toByte(), 0x00.toByte())
+        val STATUS_NO_CARD        = byteArrayOf(0x6A.toByte(), 0x82.toByte())
+        val STATUS_FILE_NOT_FOUND = byteArrayOf(0x6A.toByte(), 0x82.toByte()) // SW 6A82
+
         @Volatile var pendingData: PendingPayment? = null
         @Volatile var pendingCallback: ((ByteArray) -> Unit)? = null
 
         data class PendingPayment(
             val card: BankCard,
-            val amountCents: Int,
+            val amountCents: Long,          // FIX #6: Long
             val currency: String,
             val nonce: String,
             val timestamp: String,
-            val atc: Int,
+            val atc: Long,                  // FIX #6: Long
         )
 
-        /** Incrementează ATC și returnează noua valoare. Partajat cu WifiPaymentClient. */
-        fun getAndIncrementAtc(context: Context): Int {
-            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val next = prefs.getInt(KEY_ATC, 0) + 1
-            prefs.edit().putInt(KEY_ATC, next).apply()
+        /**
+         * FIX #10: EncryptedSharedPreferences pentru ATC.
+         * Previne manipularea contorului pe telefoane rootate.
+         */
+        fun getEncryptedPrefs(context: Context): android.content.SharedPreferences {
+            return try {
+                val masterKey = MasterKey.Builder(context)
+                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                    .build()
+                EncryptedSharedPreferences.create(
+                    context,
+                    PREFS_NAME,
+                    masterKey,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                )
+            } catch (e: Exception) {
+                // Fallback la plain prefs dacă EncryptedSharedPreferences eșuează (dispozitive vechi)
+                Log.w(TAG, "EncryptedSharedPreferences indisponibil, fallback: ${e.message}")
+                context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            }
+        }
+
+        /**
+         * FIX #6: Incrementează ATC și returnează noua valoare ca Long.
+         * Partajat cu fluxul WiFi Direct din WalletScreen.
+         *
+         * Strategia ATC:
+         *   - Valoarea inițială = System.currentTimeMillis() / 1000 (timestamp Unix în secunde)
+         *   - Incrementat cu +1 la fiecare tranzacție
+         *   - Garantat crescător, compatibil cu BIGINT PostgreSQL
+         */
+        fun getAndIncrementAtc(context: Context): Long {
+            val prefs = getEncryptedPrefs(context)
+            val current = prefs.getLong(KEY_ATC, System.currentTimeMillis() / 1000L)
+            val next = current + 1L
+            prefs.edit().putLong(KEY_ATC, next).apply()
             return next
         }
 
         /**
-         * Construiește răspunsul final: DPAN|ATC|MAC + 9000.
-         * Apelat atât sincron (sumă mică) cât și din BiometricPaymentActivity (sumă mare).
+         * Construiește răspunsul final NFC: DPAN|ATC|MAC + 9000.
+         *
+         * FIX #6: amountCents și atc sunt Long.
          */
         fun buildPaymentResponse(
             card: BankCard,
-            amountCents: Int,
+            amountCents: Long,
             currency: String,
             nonce: String,
             timestamp: String,
-            atc: Int,
+            atc: Long,
         ): ByteArray {
-            // STATE 3: Calcul MAC 2-step (K_user din Keystore)
             val mac = if (KeystoreManager.hasKey(card.id)) {
                 CryptoUtils.computeMacFromKeystore(
-                    cardId = card.id,
-                    amountCents = amountCents,
-                    currency = currency,
-                    posNonce = nonce,
+                    cardId            = card.id,
+                    amountCents       = amountCents,
+                    currency          = currency,
+                    posNonce          = nonce,
                     terminalTimestamp = timestamp,
-                    atc = atc
+                    atc               = atc
                 )
             } else {
-                // Fallback la secretKey din BankCard (compatibilitate backward)
                 CryptoUtils.computeMac(
-                    kUserHex = card.secretKey,
-                    amountCents = amountCents,
-                    currency = currency,
-                    posNonce = nonce,
+                    kUserHex          = card.secretKey,
+                    amountCents       = amountCents,
+                    currency          = currency,
+                    posNonce          = nonce,
                     terminalTimestamp = timestamp,
-                    atc = atc
+                    atc               = atc
                 )
             }
 
             Log.i(TAG, "STATE 3+4: DPAN=${card.dpan.take(8)}… ATC=$atc MAC=${mac.take(16)}…")
 
-            // STATE 4: Răspuns final
             val response = "${card.dpan}|$atc|$mac"
             return response.toByteArray(StandardCharsets.UTF_8) + STATUS_SUCCESS
         }

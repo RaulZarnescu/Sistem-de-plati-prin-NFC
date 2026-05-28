@@ -14,9 +14,11 @@ import javax.crypto.spec.SecretKeySpec
  * K_user (hmac_key_hex) este importată în Keystore și NICIODATĂ extrasă în clar.
  * Operațiile HMAC se fac direct cu cheia din Keystore (hardware TEE unde e disponibil).
  *
- * Formula 2-step HMAC (aliniat cu backend Python):
- *   Session_Key = HMAC-SHA256(K_user, str(ATC))
- *   MAC         = HMAC-SHA256(Session_Key, mac_input)
+ * Formula 2-step HMAC (aliniat cu backend Python shared/crypto_utils.py):
+ *   Session_Key = HMAC-SHA256(K_user, str(ATC).encode("utf-8"))
+ *   MAC         = HMAC-SHA256(Session_Key, mac_input.encode("utf-8"))
+ *
+ * FIX: ATC schimbat din Int la Long (BIGINT / int64 conform spec).
  */
 object KeystoreManager {
 
@@ -50,24 +52,28 @@ object KeystoreManager {
 
     /**
      * Step 1: Session_Key = HMAC-SHA256(K_user, str(atc))  ← K_user rămâne în hardware
-     * Step 2: MAC = HMAC-SHA256(Session_Key, mac_input)    ← în memorie, Session_Key sters după
+     * Step 2: MAC = HMAC-SHA256(Session_Key, mac_input)    ← în memorie, Session_Key șters după
+     *
+     * FIX: atc este Long (BIGINT) — corespunde specificației și PostgreSQL BIGINT.
+     * str(atc) produce același string ca Python str(atc) pentru aceleași valori.
      */
     fun computeMac(
         cardId: String,
-        amountCents: Int,
+        amountCents: Long,
         currency: String,
         posNonce: String,
         terminalTimestamp: String,
-        atc: Int
+        atc: Long
     ): String {
         // Step 1 — K_user în Keystore, sesiunea derivată în memorie
         val sessionKey = computeSessionKey(cardId, atc)
 
         // Step 2 — MAC final
+        // Format identic cu Python: "{amount_cents}|{currency}|{pos_nonce}|{terminal_timestamp}|{atc}"
         val macInput = "$amountCents|$currency|$posNonce|$terminalTimestamp|$atc"
         val macBytes = hmacSha256(sessionKey, macInput.toByteArray(Charsets.UTF_8))
 
-        // Șterge session_key din memorie imediat după use
+        // Șterge session_key din memorie imediat după use (best effort)
         sessionKey.fill(0)
 
         return macBytes.joinToString("") { "%02x".format(it) }
@@ -76,8 +82,10 @@ object KeystoreManager {
     /**
      * Derivă Session_Key = HMAC-SHA256(K_user, str(ATC)) folosind cheia din Keystore.
      * K_user nu este niciodată accesibilă în afara Keystore.
+     *
+     * FIX: atc este Long.
      */
-    fun computeSessionKey(cardId: String, atc: Int): ByteArray {
+    fun computeSessionKey(cardId: String, atc: Long): ByteArray {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
         keyStore.load(null)
 
@@ -86,6 +94,7 @@ object KeystoreManager {
 
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(key)
+        // str(atc) — identic cu Python str(atc): număr decimal fără padding
         return mac.doFinal(atc.toString().toByteArray(Charsets.UTF_8))
     }
 

@@ -58,7 +58,8 @@ class BiometricPaymentActivity : FragmentActivity() {
             },
         )
 
-        val amountCents = intent.getLongExtra(EXTRA_AMOUNT_CENTS, 0L)
+        // FIX #6: amountCents este Long
+        val amountCents: Long = intent.getLongExtra(EXTRA_AMOUNT_CENTS, 0L)
         val currency    = intent.getStringExtra(EXTRA_CURRENCY) ?: "RON"
 
         val amountDisplay = formatAmount(amountCents, currency)

@@ -61,15 +61,13 @@ import com.example.sistemplatanfc.data.DevCardSeeder
 import com.example.sistemplatanfc.hce.PaymentHceService
 import com.example.sistemplatanfc.model.BankCard
 import com.example.sistemplatanfc.network.EnrollRequest
-import com.example.sistemplatanfc.network.LoginRequest
-import com.example.sistemplatanfc.network.PaymentEvent
 import com.example.sistemplatanfc.network.RetrofitClient
 import com.example.sistemplatanfc.network.TransactionItem
 import com.example.sistemplatanfc.network.WifiPaymentClient
 import com.example.sistemplatanfc.security.KeystoreManager
 import com.example.sistemplatanfc.security.SecureStorage
 import com.example.sistemplatanfc.utils.BiometricHelper
-import java.nio.charset.StandardCharsets
+import com.example.sistemplatanfc.utils.CryptoUtils
 
 // ─── Culori globale ────────────────────────────────────────────────────────────
 
@@ -123,13 +121,28 @@ class MainActivity : AppCompatActivity() {
         // Înrolează cardurile de test la primul start (fără backend de enrollment)
         DevCardSeeder.seed(this)
 
+        // FIX #5: dacă IP-ul serverului nu e configurat, arată dialog la prima rulare
+        val needsServerIp = secureStorage.getServerIp().isNullOrBlank()
+
         val initialScreen = "wallet" // login eliminat — backend wallet indisponibil
 
         setContent {
             var currentScreen by remember { mutableStateOf(initialScreen) }
+            var showServerIpSetup by remember { mutableStateOf(needsServerIp) }
 
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = AppBackground) {
+
+                    // FIX #5: Dialog configurare IP backend la prima lansare
+                    if (showServerIpSetup) {
+                        ServerIpSetupDialog(
+                            onConfirm = { ip ->
+                                secureStorage.storeServerIp(ip)
+                                RetrofitClient.invalidate()
+                                showServerIpSetup = false
+                            }
+                        )
+                    }
 
                     // Ordinea stabileşte direcţia animaţiei slide
                     val screenOrder = listOf("login", "wallet", "dashboard", "cards", "addCard")
@@ -278,12 +291,18 @@ fun LoginScreen(onLoginSuccess: () -> Unit) {
                 isLoading    = true
                 scope.launch {
                     try {
-                        val resp = RetrofitClient.instance.login(LoginRequest(username, pin))
-                        RetrofitClient.setToken(resp.token)
-                        SecureStorage.getInstance(context).storeAuthToken(resp.token)
-                        onLoginSuccess()
+                        // Autentificarea se face via JWT primit la enroll (POST /api/v1/enroll).
+                        // Ecranul de login este dezactivat temporar — app pornește direct din wallet.
+                        // Token-ul JWT este restaurat din SecureStorage la fiecare pornire.
+                        val savedToken = SecureStorage.getInstance(context).getAuthToken()
+                        if (savedToken != null) {
+                            RetrofitClient.setToken(savedToken)
+                            onLoginSuccess()
+                        } else {
+                            errorMessage = "Niciun token JWT. Adaugă un card mai întâi."
+                        }
                     } catch (e: Exception) {
-                        errorMessage = "Autentificare eșuată: ${e.message ?: "Verificați conexiunea."}"
+                        errorMessage = "Eroare: ${e.message ?: "Verificați conexiunea."}"
                     } finally {
                         isLoading = false
                     }
@@ -334,6 +353,7 @@ fun WalletScreen(
     var paymentState  by remember { mutableStateOf<PaymentUiState>(PaymentUiState.Idle) }
     var paymentClient by remember { mutableStateOf<WifiPaymentClient?>(null) }
     var posIpInput    by remember { mutableStateOf(secureStorage.getPosIp() ?: "") }
+    val scope         = rememberCoroutineScope()
 
     var balance      by remember { mutableStateOf<Double?>(null) }
     var currency     by remember { mutableStateOf("RON") }
@@ -345,7 +365,7 @@ fun WalletScreen(
         if (dpan != null) {
             isFetchingBalance = true
             try {
-                val resp = RetrofitClient.instance.getBalance(dpan)
+                val resp = RetrofitClient.getInstance(context).getBalance(dpan)
                 balance = resp.balance
                 currency = resp.currency
             } catch (e: Exception) {
@@ -358,24 +378,48 @@ fun WalletScreen(
         }
     }
 
-    // Construiește și trimite răspunsul de plată către POS
-    fun sendPaymentResponse(
+    /**
+     * FIX #1+#6: Calculează MAC direct și trimite HTTP POST /payment-response la ESP32.
+     * Înlocuiește vechea implementare WebSocket + APDU parsing.
+     * ATC este Long (BIGINT).
+     */
+    suspend fun sendPaymentResponseNew(
         client: WifiPaymentClient,
         card: BankCard,
         amountCents: Long,
-        currency: String,
+        txCurrency: String,
         nonce: String,
         timestamp: String
     ) {
-        val atc = PaymentHceService.getAndIncrementAtc(context)
-        val responseBytes = PaymentHceService.buildPaymentResponse(
-            card, amountCents.toInt(), currency, nonce, timestamp, atc
-        )
-        // responseBytes = "dpan|atc|mac" + [0x90, 0x00] → scoatem ultimii 2 bytes
-        val responseStr = String(responseBytes, 0, responseBytes.size - 2, StandardCharsets.UTF_8)
-        val parts = responseStr.split("|")
-        client.sendPaymentResponse(dpan = parts[0], atc = parts[1].toInt(), mac = parts[2])
-        paymentState = PaymentUiState.Processing(amountCents, currency)
+        val atc: Long = PaymentHceService.getAndIncrementAtc(context)
+        val dpan = secureStorage.getDpan(card.id) ?: card.dpan
+        val mac = if (KeystoreManager.hasKey(card.id)) {
+            CryptoUtils.computeMacFromKeystore(
+                cardId            = card.id,
+                amountCents       = amountCents,
+                currency          = txCurrency,
+                posNonce          = nonce,
+                terminalTimestamp = timestamp,
+                atc               = atc
+            )
+        } else {
+            CryptoUtils.computeMac(
+                kUserHex          = card.secretKey,
+                amountCents       = amountCents,
+                currency          = txCurrency,
+                posNonce          = nonce,
+                terminalTimestamp = timestamp,
+                atc               = atc
+            )
+        }
+        paymentState = PaymentUiState.Processing(amountCents, txCurrency)
+        val success = client.sendPaymentResponse(dpan = dpan, atc = atc, mac = mac)
+        paymentState = if (success) {
+            PaymentUiState.Result(approved = true, reason = null)
+        } else {
+            PaymentUiState.Error("ESP32 a refuzat tranzacția (409) sau eroare rețea")
+        }
+        paymentClient = null
     }
 
     fun cancelPayment() {
@@ -384,41 +428,54 @@ fun WalletScreen(
         paymentState  = PaymentUiState.Idle
     }
 
-    // Colectează evenimentele WebSocket
+    /**
+     * FIX #1: Polling HTTP REST în loc de WebSocket.
+     * LaunchedEffect se restartează când paymentClient se schimbă (creat / setat null).
+     * Când paymentClient devine null (cancel), efectul anterior e anulat automat.
+     */
     LaunchedEffect(paymentClient) {
         val client = paymentClient ?: return@LaunchedEffect
         try {
-            client.events.collect { event ->
-                when (event) {
-                    PaymentEvent.Connecting      -> paymentState = PaymentUiState.Connecting
-                    PaymentEvent.Connected       -> paymentState = PaymentUiState.AwaitingRequest
-                    is PaymentEvent.PaymentRequested -> {
-                        val card = CardManager.getActiveCard()
-                        if (card == null) {
-                            paymentState = PaymentUiState.Error("Niciun card activ")
-                            client.close(); paymentClient = null; return@collect
-                        }
-                        val threshold = secureStorage.getBiometricThresholdCents()
-                        if (event.amountCents > threshold) {
-                            paymentState = PaymentUiState.ConfirmPayment(
-                                event.amountCents, event.currency, event.nonce, event.timestamp
-                            )
-                        } else {
-                            sendPaymentResponse(client, card, event.amountCents, event.currency, event.nonce, event.timestamp)
-                        }
-                    }
-                    is PaymentEvent.PaymentResult -> {
-                        paymentState = PaymentUiState.Result(event.approved, event.reason)
-                        client.close(); paymentClient = null
-                    }
-                    is PaymentEvent.ConnectionError -> {
-                        paymentState = PaymentUiState.Error(event.message)
-                        client.close(); paymentClient = null
-                    }
-                }
+            paymentState = PaymentUiState.AwaitingRequest
+
+            val data = client.pollPaymentRequest(timeoutMs = 30_000L, intervalMs = 500L)
+
+            if (data == null) {
+                // Timeout 30s — ESP32 nu a trimis nicio cerere
+                paymentState = PaymentUiState.Error(
+                    "Timeout: apropiați telefonul de terminal în 30 de secunde"
+                )
+                paymentClient = null
+                return@LaunchedEffect
             }
-        } finally {
-            client.close()
+
+            val card = CardManager.getActiveCard()
+            if (card == null) {
+                paymentState = PaymentUiState.Error("Niciun card activ")
+                paymentClient = null
+                return@LaunchedEffect
+            }
+
+            val threshold = secureStorage.getBiometricThresholdCents()
+            if (data.amountCents > threshold) {
+                // Suma depășește pragul biometric → biometrie necesară
+                // LaunchedEffect(confirmState) de mai jos preia controlul
+                paymentState = PaymentUiState.ConfirmPayment(
+                    data.amountCents, data.currency, data.posNonce, data.terminalTimestamp
+                )
+            } else {
+                // Sub prag → trimite imediat fără biometrie
+                sendPaymentResponseNew(
+                    client, card,
+                    data.amountCents, data.currency, data.posNonce, data.terminalTimestamp
+                )
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Anulat de utilizator via cancelPayment() — normal, nu afișăm eroare
+            throw e
+        } catch (e: Exception) {
+            paymentState = PaymentUiState.Error("Eroare conexiune: ${e.message}")
+            paymentClient = null
         }
     }
 
@@ -431,15 +488,19 @@ fun WalletScreen(
         BiometricHelper.showBiometricPrompt(
             activity  = activity,
             onSuccess = {
-                if (paymentClient != null) {
-                    sendPaymentResponse(client, card, state.amountCents, state.currency, state.nonce, state.timestamp)
+                // FIX: scope.launch necesar — sendPaymentResponseNew e suspend
+                scope.launch {
+                    val currentClient = paymentClient ?: return@launch
+                    sendPaymentResponseNew(
+                        currentClient, card,
+                        state.amountCents, state.currency, state.nonce, state.timestamp
+                    )
                 }
             },
             onError = { error ->
-                if (paymentClient != null) {
-                    paymentState = PaymentUiState.Error("Biometrie eșuată: $error")
-                    client.close(); paymentClient = null
-                }
+                paymentState = PaymentUiState.Error("Biometrie eșuată: $error")
+                client.close()
+                paymentClient = null
             }
         )
     }
@@ -561,9 +622,10 @@ fun WalletScreen(
                                 paymentState = PaymentUiState.EnterIp
                             } else {
                                 posIpInput = secureStorage.getPosIp()!!
-                                val client = WifiPaymentClient(posIpInput)
-                                paymentClient = client
-                                client.connect()
+                                // FIX #1: nu mai există connect() — polling pornește automat
+                                // când paymentClient e setat (LaunchedEffect reacționează)
+                                paymentState = PaymentUiState.Connecting
+                                paymentClient = WifiPaymentClient(posIpInput)
                             }
                         },
                         enabled = (paymentState == PaymentUiState.Idle),
@@ -664,9 +726,9 @@ fun WalletScreen(
             onConnect   = {
                 if (posIpInput.isNotBlank()) {
                     secureStorage.storePosIp(posIpInput)
-                    val client = WifiPaymentClient(posIpInput)
-                    paymentClient = client
-                    client.connect()
+                    // FIX #1: fără connect() — polling pornește via LaunchedEffect
+                    paymentState = PaymentUiState.Connecting
+                    paymentClient = WifiPaymentClient(posIpInput)
                 }
             },
             onDismiss   = { paymentState = PaymentUiState.Idle }
@@ -881,10 +943,10 @@ fun DashboardScreen(onBack: () -> Unit) {
         }
         isLoading = true
         try {
-            val balResp = RetrofitClient.instance.getBalance(dpan)
+            val balResp = RetrofitClient.getInstance(context).getBalance(dpan)
             balance  = balResp.balance
             currency = balResp.currency
-            transactions = RetrofitClient.instance.getTransactionHistory(dpan)
+            transactions = RetrofitClient.getInstance(context).getTransactionHistory(dpan)
         } catch (e: Exception) {
             errorMessage = "Eroare încărcare date: ${e.message ?: "Verificați conexiunea."}"
         } finally {
@@ -1395,11 +1457,12 @@ fun AddCardScreen(onBack: () -> Unit) {
                         val secureStorage = SecureStorage.getInstance(context)
                         val deviceId      = secureStorage.getDeviceId()
 
-                        // expiryRaw = "MMYY" → expiryMonth = "MM", expiryYear = "20YY"
+                        // FIX #3: expiryYear = 2 cifre ("28" nu "2028")
+                        // expiryRaw = "MMYY" → expiryMonth = "MM", expiryYear = "YY"
                         val expiryMonth = expiryRaw.take(2)
-                        val expiryYear  = "20${expiryRaw.drop(2)}"
+                        val expiryYear  = expiryRaw.drop(2)   // "28" — NU "2028"
 
-                        val enrolled = RetrofitClient.instance.enrollCard(
+                        val enrolled = RetrofitClient.getInstance(context).enrollCard(
                             EnrollRequest(
                                 pan         = panDigits,
                                 expiryMonth = expiryMonth,
@@ -1424,6 +1487,11 @@ fun AddCardScreen(onBack: () -> Unit) {
                         enrolled.bankPublicKeyPemB64?.let {
                             secureStorage.storeBankPublicKey(enrolled.id, it)
                         }
+
+                        // FIX #4: Salvează JWT primit la enroll
+                        secureStorage.storeAuthToken(enrolled.jwtToken)
+                        secureStorage.storeJwtExpiry(enrolled.jwtExpiresAt)
+                        RetrofitClient.setToken(enrolled.jwtToken)
 
                         // Creează BankCard și adaugă în CardManager
                         val bankCard = BankCard(
@@ -1568,6 +1636,106 @@ fun CardPreviewWidget(panDigits: String, expiry: String, cardholderName: String)
                     fontSize   = 13.sp,
                     fontWeight = FontWeight.Medium
                 )
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVER IP SETUP DIALOG — FIX #5
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Dialog la prima lansare pentru configurarea IP-ului laptopului cu Docker.
+ *
+ * Apare o singură dată dacă IP-ul nu e salvat în SecureStorage.
+ * Poate fi relansat din ecranul de setări (dacă e implementat).
+ */
+@Composable
+fun ServerIpSetupDialog(onConfirm: (String) -> Unit) {
+    var ipInput by remember { mutableStateOf(RetrofitClient.DEFAULT_GATEWAY_IP) }
+    var hasError by remember { mutableStateOf(false) }
+
+    Dialog(onDismissRequest = { /* Obligatoriu — nu poate fi închis fără a confirma IP */ }) {
+        Card(
+            shape  = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(containerColor = AppBackground),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text       = "Configurare Server",
+                    fontFamily = TiemposHeadline,
+                    fontSize   = 22.sp,
+                    color      = PrimaryText
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text       = "Introduceți IP-ul laptopului cu Docker\n(rețeaua WiFi de demo)",
+                    fontFamily = Afacad,
+                    fontSize   = 14.sp,
+                    color      = SecondaryText,
+                    textAlign  = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(20.dp))
+
+                OutlinedTextField(
+                    value         = ipInput,
+                    onValueChange = {
+                        ipInput = it.trim()
+                        hasError = false
+                    },
+                    label         = { Text("IP laptop (ex: 192.168.1.100)", fontFamily = Afacad) },
+                    placeholder   = { Text("192.168.1.100", fontFamily = Afacad) },
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Uri,
+                        imeAction    = ImeAction.Done
+                    ),
+                    isError       = hasError,
+                    singleLine    = true,
+                    modifier      = Modifier.fillMaxWidth(),
+                    colors        = cardFormColors(),
+                    textStyle     = LocalTextStyle.current.copy(fontFamily = Afacad)
+                )
+                if (hasError) {
+                    Text(
+                        text       = "IP invalid. Format: 192.168.X.Y",
+                        color      = Color(0xFFB00020),
+                        fontFamily = Afacad,
+                        fontSize   = 12.sp,
+                        modifier   = Modifier.padding(top = 4.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text       = "Portul 8443 și https:// sunt adăugate automat.\nPe emulator: 10.0.2.2",
+                    fontFamily = Afacad,
+                    fontSize   = 12.sp,
+                    color      = SecondaryText.copy(alpha = 0.7f),
+                    textAlign  = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(24.dp))
+
+                Button(
+                    onClick = {
+                        // Validare simplă format IP
+                        val ipRegex = Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")
+                        if (ipInput.isNotBlank() && (ipRegex.matches(ipInput) || ipInput == "10.0.2.2")) {
+                            onConfirm(ipInput)
+                        } else {
+                            hasError = true
+                        }
+                    },
+                    colors   = ButtonDefaults.buttonColors(containerColor = DarkButtonBackground),
+                    shape    = RoundedCornerShape(28.dp),
+                    modifier = Modifier.fillMaxWidth().height(48.dp)
+                ) {
+                    Text("Salvează", fontFamily = Afacad, fontSize = 16.sp, color = Color.White)
+                }
             }
         }
     }

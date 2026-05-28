@@ -10,26 +10,28 @@ object CryptoUtils {
     /**
      * Calcul MAC 2-step — FORMULA EXACTĂ AGREATĂ CU BACKEND-UL PYTHON:
      *
-     *   Session_Key = HMAC-SHA256(K_user, str(ATC))
+     *   Session_Key = HMAC-SHA256(K_user, str(ATC).encode("utf-8"))
      *   MAC_Input   = "{amount_cents}|{currency}|{nonce}|{timestamp}|{atc}"
      *   MAC         = HMAC-SHA256(Session_Key, MAC_Input.encode("utf-8")).hexdigest()
      *
      * Atenții:
-     *   - amount în CENȚI ca string întreg ("15000" nu "150.00")
+     *   - amount_cents în CENȚI ca Long ("15000" nu "150.00")
      *   - nonce exact cum a venit de la POS (hex uppercase 8 chars)
      *   - timestamp exact cum a venit de la POS (ISO 8601 UTC)
-     *   - atc = Transaction Counter ca integer
+     *   - atc = Transaction Counter ca Long (BIGINT — FIX față de Int anterior)
      *
-     * Această versiune folosește K_user din FIȘIER (pentru compatibilitate backward).
+     * Această versiune folosește K_user din parametru (pentru fallback/compatibilitate).
      * Preferă computeMacFromKeystore() când cheia e stocată în Keystore.
+     *
+     * FIX: amountCents și atc schimbate din Int la Long.
      */
     fun computeMac(
         kUserHex: String,
-        amountCents: Int,
+        amountCents: Long,
         currency: String,
         posNonce: String,
         terminalTimestamp: String,
-        atc: Int
+        atc: Long
     ): String {
         // Step 1: Session_Key = HMAC-SHA256(K_user, str(ATC))
         val kUserBytes = KeystoreManager.hexToBytes(kUserHex)
@@ -45,15 +47,17 @@ object CryptoUtils {
 
     /**
      * Versiunea securizată: K_user rămâne în Android Hardware Keystore.
-     * Se folosește în PaymentHceService și BiometricPaymentActivity.
+     * Se folosește în PaymentHceService și fluxul WiFi Direct.
+     *
+     * FIX: amountCents și atc schimbate din Int la Long.
      */
     fun computeMacFromKeystore(
         cardId: String,
-        amountCents: Int,
+        amountCents: Long,
         currency: String,
         posNonce: String,
         terminalTimestamp: String,
-        atc: Int
+        atc: Long
     ): String {
         return KeystoreManager.computeMac(
             cardId = cardId,

@@ -23,7 +23,64 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include "config.h"
+
+// --- Certificate NVS ----------------------------------------
+// Populate din NVS la boot via loadCertificatesFromNVS()
+String g_ca_cert;
+String g_client_cert;
+String g_client_key;
+String g_bank_pub;
+bool   g_certs_loaded = false;
+
+bool loadCertificatesFromNVS() {
+    Preferences prefs;
+    prefs.begin("certs", true);  // true = read-only
+
+    g_ca_cert     = prefs.getString("ca_cert",     "");
+    g_client_cert = prefs.getString("client_cert", "");
+    g_client_key  = prefs.getString("client_key",  "");
+    g_bank_pub    = prefs.getString("bank_pub",    "");
+
+    prefs.end();
+
+    if (g_ca_cert.isEmpty() || g_client_cert.isEmpty() ||
+        g_client_key.isEmpty() || g_bank_pub.isEmpty()) {
+        Serial.println("EROARE: Certificate lipsa in NVS!");
+        Serial.println("   Flasheaza mai intai provisioning.ino");
+        return false;
+    }
+
+    Serial.println("[Certs] Certificate incarcate din NVS.");
+    return true;
+}
+
+// Apelat după /api/pki/renew — scrie certificatul nou în NVS
+// și actualizează variabilele globale fără restart.
+// LIMITARE PoC: cheia privată NU se actualizează via /pki/renew.
+// În producție, ESP32 ar genera o cheie nouă local și ar trimite CSR-ul.
+void updateCertificateInNVS(const String& new_cert,
+                             const String& new_bank_pub) {
+    Preferences prefs;
+    prefs.begin("certs", false);  // false = read/write
+
+    prefs.putString("client_cert", new_cert);
+
+    if (!new_bank_pub.isEmpty()) {
+        prefs.putString("bank_pub", new_bank_pub);
+    }
+
+    prefs.end();
+
+    g_client_cert = new_cert;
+    if (!new_bank_pub.isEmpty()) {
+        g_bank_pub = new_bank_pub;
+    }
+
+    Serial.println("[Certs] Certificat nou salvat in NVS.");
+    Serial.println("        Activ la urmatoarea conexiune mTLS.");
+}
 
 // --- NFC ----------------------------------------------------
 Adafruit_PN532 nfc(PN532_IRQ_PIN, PN532_RESET_PIN);
@@ -268,6 +325,14 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n\n=== NFC POS Terminal — Boot ===");
+
+    // 1. Încarcă certificatele din NVS — primul pas, înainte de WiFi sau NFC
+    g_certs_loaded = loadCertificatesFromNVS();
+    if (!g_certs_loaded) {
+        Serial.println("EROARE SECURITATE: Certificate lipsa in NVS! (Cod: 0x02)");
+        Serial.println("Flasheaza provisioning.ino, apoi reflasheaza codul principal.");
+        while (true) delay(1000);  // HALT
+    }
 
     // --- Inițializare NFC ---
     Wire.begin();

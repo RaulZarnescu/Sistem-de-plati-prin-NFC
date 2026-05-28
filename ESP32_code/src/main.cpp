@@ -26,24 +26,24 @@
 //   - Reconectare WiFi automata in loop()
 // ============================================================
 
+#include <Adafruit_GFX.h>
 #include <Adafruit_PN532.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <Keypad.h>
-#include <SPI.h>
 #include <MCUFRIEND_kbv.h>
-#include <Adafruit_GFX.h>
+#include <SPI.h>
 
 // Culori compatibilitate TFT_eSPI
-#define TFT_BLACK   0x0000
-#define TFT_WHITE   0xFFFF
-#define TFT_RED     0xF800
-#define TFT_GREEN   0x07E0
-#define TFT_BLUE    0x001F
-#define TFT_YELLOW  0xFFE0
-#define TFT_CYAN    0x07FF
+#define TFT_BLACK 0x0000
+#define TFT_WHITE 0xFFFF
+#define TFT_RED 0xF800
+#define TFT_GREEN 0x07E0
+#define TFT_BLUE 0x001F
+#define TFT_YELLOW 0xFFE0
+#define TFT_CYAN 0x07FF
 #define TFT_MAGENTA 0xF81F
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -57,6 +57,7 @@
 #include <mbedtls/rsa.h>
 #include <mbedtls/x509.h>
 #include <mbedtls/x509_crt.h>
+#include <mbedtls/sha256.h>
 #include <mbedtls/x509_csr.h>
 
 #include <Preferences.h>
@@ -86,10 +87,8 @@
 // ── Keypad 3x4 (Remapată pentru a evita conflictele de pini) ──
 const byte ROWS = 4;
 const byte COLS = 3;
-char keys[ROWS][COLS] = {{'1', '2', '3'},
-                         {'4', '5', '6'},
-                         {'7', '8', '9'},
-                         {'*', '0', '#'}};
+char keys[ROWS][COLS] = {
+    {'1', '2', '3'}, {'4', '5', '6'}, {'7', '8', '9'}, {'*', '0', '#'}};
 byte rowPins[ROWS] = {KEYPAD_R1, KEYPAD_R2, KEYPAD_R3, KEYPAD_R4};
 byte colPins[COLS] = {KEYPAD_C1, KEYPAD_C2, KEYPAD_C3};
 
@@ -137,112 +136,19 @@ const char *pki_renew_path = "/api/pki/renew";
 const uint8_t bank_aid[] = {0xF1, 0xC7, 0x1B, 0x3B, 0x4E, 0x4B, 0x01};
 
 // ── Certificate PEM ───────────────────────────────────────────
-// Inlocuieste continutul cu certificatele reale generate de CA-ul intern.
-const char root_ca_pem[] = R"EOF(
------BEGIN CERTIFICATE-----
-MIIFWTCCA0GgAwIBAgIUAdTlb92c83ekn34pFv7MKNy8X+kwDQYJKoZIhvcNAQEL
-BQAwPDELMAkGA1UEBhMCUk8xFDASBgNVBAoMC0ZpY3RpdmVCYW5rMRcwFQYDVQQD
-DA5ORkMtUGF5bWVudC1DQTAeFw0yNjA1MjYxNDI3MTdaFw0zNjA1MjMxNDI3MTda
-MDwxCzAJBgNVBAYTAlJPMRQwEgYDVQQKDAtGaWN0aXZlQmFuazEXMBUGA1UEAwwO
-TkZDLVBheW1lbnQtQ0EwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCt
-rOI/XewpzPxMlFB0T9rbElqwwbkAvxUG+T6AKSBTXvPXSoaup9I4OQ8jmVHjyVKm
-PcmoVvvfMEpnS0APs/Fh3LYEJVex5DVse2X1PFPMGxtT5F5DlIJQcgElhnXKj4Kv
-NxMFfRQki6nW7oidT2TRNDasJ3zDz6aVet/gTsDlF/SOcZoQhhxSlJ1sEQBeEy0+
-yjxNl16BxYH295jXhXKXj6OUOIw0yzdX3nVIk2/PybyxiPPbZl/MfeRqVZkNSN5d
-zl4O8cC8eVbhybYL6jspxWB2/bbsJ9n/zsC+0DvcBr06eGLYJJlzv/ByDKnyg2cZ
-K9MliGM+7zZD4AY9fx0LwDLL8Qya+R+8yrdFsr6lrxqFmkypLBnyGneYIzY4UPV+
-Ube/XvQ/wrPDVZVx+aVEX8xsFchl37gBwAC6kWYP6wzP6fTWU4TUn8zo4igHnVc7
-UWOdUf89Oz3vLpj69MWUvJiUMCQfThDww1RCSYnzIA+iR0/I8WGI/ZsmQ6dcqv9x
-btK7JY0sViwFNXPjmzje/EBiNghgDyNHg6S1wTnqORe7Ygzk50EyAYLa0DlKCpfD
-hil60J6ZEjp/Y1sbXz7cI4xtJwOvoMhsxXbMXfr8ZawMlK+QhHp0ZhucoOARMm3y
-OcTKZqAgYp1e0Xgu7Y/gvKIONjZLILgiErXUkg28aQIDAQABo1MwUTAdBgNVHQ4E
-FgQUwBmTRfcD14BJJsM5S2gE8Mk9STwwHwYDVR0jBBgwFoAUwBmTRfcD14BJJsM5
-S2gE8Mk9STwwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAgEAdFMG
-Brii8gYjhgMgFSONXgkJ9kqTgeqtO0THfHZHe7/JZpdDnSlSxvLfsYdUEuIrtYdi
-BufCEJsO6laqfaF0Uvii+HYXmwDhlOApdseNdboHVG152PsAWlgWvwngDw85thkB
-fi0gU7KmUSL/RWaTU5Jd90FwYaDR6XmvyPrt42N2jpmoQhkKSE+68k75JD2tBSNb
-lffYkL3UBOyM7I/Tr2ON10E+vw8VYRvs8sKQuFt3mGCayl0csrY4G+kAyzhL1tZv
-OMR8E+UhmP1WaiEKaPum7RqR0nD4WfBUpQ7Nf3T+0VE5IR1Aau4SH0KKLhwCDNT0
-4iRZtqNd6p4CSLXk1pA+hh+ftvoS8Wo9nlTHBu2BxN9JT0ji8g/sGY5EqsMMeCi8
-dISwWpPwnQ/IejTUcL3pFeei5s+ebzdCIk2mDXFXXG/gSCCz/9sKup6vZywLrR3b
-aKFKRaTHCjBt+jwB7b/0lDy6o8CCh8D812Pa4IAQhFGC1HfNjIE51A9KJdjtpATy
-RJLTxAL9XtL3kkNRUtxqUAa9JabpUwK+By9blzGDhWbRxyx6xeXlpfsD1/UzBWZi
-yDNTYuGYGnViOKDPpvWEkZQOiac3msjH9hr+09km+D7rSAB73djFmjOcNM4Kq6so
-zFHx9StHkWxAzV7EORNNhFYl8Wva2dQDDnTQDLU=
------END CERTIFICATE-----
-)EOF";
-
-const char client_cert_pem[] = R"EOF(
------BEGIN CERTIFICATE-----
-MIIERTCCAi2gAwIBAgIUDzB26FHqHqVDnH+cppv/ZhSlbmMwDQYJKoZIhvcNAQEL
-BQAwPDELMAkGA1UEBhMCUk8xFDASBgNVBAoMC0ZpY3RpdmVCYW5rMRcwFQYDVQQD
-DA5ORkMtUGF5bWVudC1DQTAeFw0yNjA1MjYxNDI3MTdaFw0yNjA2MjUxNDI3MTda
-MDkxCzAJBgNVBAYTAlJPMRQwEgYDVQQKDAtGaWN0aXZlQmFuazEUMBIGA1UEAwwL
-UE9TLUJVQy0wMDEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDFYMEd
-AKoCBQzpEXLX6HbtJem0LfSapjkcLCV7zYmCAXWuqPQpfH+hTe8GIVDVxIwWsU4c
-CoOrALU+ZmbcC8MegZorKI4zlx0FMYOkE+Ik2xccOczn8PZarrnUqz5AmGlqUfSv
-FDkLpN92kPWqNfyxxIcCvoGWcpP62A2uKHRcGYYYgZTT95JrUgQ5lhJdos4NO7Wr
-u2Vxy8heDKT42Rq8T/ARUcsg2gIQcxp/u12T8vW+zmuXrajGjoE1keBRkbrHbFrp
-h6AedAkxM4mw9wii1sKuxkT7clGwPjamlALqFK+8ZDv02mZO5E/DLBSGLnlytxps
-8lzCimEvIpPl72DnAgMBAAGjQjBAMB0GA1UdDgQWBBQ9zEWW/982X9d45sVeF85v
-QRpo6zAfBgNVHSMEGDAWgBTAGZNF9wPXgEkmwzlLaATwyT1JPDANBgkqhkiG9w0B
-AQsFAAOCAgEASMEijW/iyWMN4LqP45Pntr6HpjsrkDDgtgZPzJVb8w7jqBJTOXYr
-wdpxzfSKujGF79oVett3zqTZU1x6Jp6DCpO3OLw84XBMHN+QEbg9V4TqcMByU+Kk
-yJrBTOkDFI0bdvev2o4MRsuI3fDKe15SpFiBKNWD/3+iw+EM1IZ7XXfqurxnYVPy
-vr9qkqEqVfbocWZsgQwAthCkT7mBiaemsqpqW/o469iIJdctPDtB9sgHxPEdGpVV
-2KT+6IIHm+BZeSXaaOndWkDp1VLKka3wsIc79rYdRRFpuTdj49/NhCTUO1MzCrjk
-UbMcAmLhbdoR0ULv7apKJMIQT+r+ZyT0q0FaWrD+DRWLSEdW6q9TsdsJihAgeA5W
-ZJ/T/iS3J6owc8W3yPVB2zgV8lHSc5rrCjj6wnHB27LylIWQ2G6On6ek3s5PC2JE
-xRjP0/mEmQo2/FyGL3HaSPwtUGN0v4QEih7EAcxBVJcRfV00ZFkYxwJ9qmv7a5S9
-H7wEJvwbTEpiQlX7mg5SCHu/xqaB3cGMxMHuy5cI/nZGrFPLKq578nWxJrSzJqzO
-TGxiZ8Z9dRFQVfwcypSrujVybRGSye2EWIK1eKN8ZVM0Q5R97r4pjtZ4iutFaseC
-GSkMLXE8u3Vor391f7vTiAYxW+DuwIXuGQO+7zjFjiTb/YGqIDoGGtQ=
------END CERTIFICATE-----
-)EOF";
-
-const char client_key_pem[] = R"EOF(
------BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDFYMEdAKoCBQzp
-EXLX6HbtJem0LfSapjkcLCV7zYmCAXWuqPQpfH+hTe8GIVDVxIwWsU4cCoOrALU+
-ZmbcC8MegZorKI4zlx0FMYOkE+Ik2xccOczn8PZarrnUqz5AmGlqUfSvFDkLpN92
-kPWqNfyxxIcCvoGWcpP62A2uKHRcGYYYgZTT95JrUgQ5lhJdos4NO7Wru2Vxy8he
-DKT42Rq8T/ARUcsg2gIQcxp/u12T8vW+zmuXrajGjoE1keBRkbrHbFrph6AedAkx
-M4mw9wii1sKuxkT7clGwPjamlALqFK+8ZDv02mZO5E/DLBSGLnlytxps8lzCimEv
-IpPl72DnAgMBAAECggEAOzBhmNXrJYHoNjhSTSbcCw+0fqDNWlcAh09Byld/penU
-JZVq6sn36CJbzGXPPNuc+u0etE/+3hfvQhApRlGMqKhK2ChoRFZLkJQhmuGPjmfZ
-DVDT/rYG2njNJ1ZW674I1qZPDvWsia5eiMq9sNZRuelqZ0tDxx8C+1Uw/QoKotdJ
-IP/kM3j5AaD6DZaNUSykSTkVQX7xl5325k0rNHPOdEdnatWk50MzhSEi7l32orBG
-y4HgX8uKd0reBEDxLMSFXl4NoZBAFi6BBF+vFAGRsxFx0/ED2c4dkJNJlm3o7p7e
-/Wf49Z3646OxkCJzRPuknP4B8YBF/qTmgK1zIFgB6QKBgQD4No0fnsT7DTFrpqPE
-vSCYrvloGb7BIn1wWW5kiaahddv+11H4Tka7FZxmn3NMi5OnfOM4Yd6ua0G8Ilpv
-YJwum19fvHQFPrE4oe1SrvRKlhYFD3xrwdMliE6KlBnZXHngGOt1AWqw7azqQJOT
-lmxtagVzeebHv4Jw1E92p9vMFQKBgQDLke+YtkHJUIdFZUhQrbsFmoaG5zah59v7
-WPyXqVGsFqmPr0wyyUynMteJF5deaWQed8kZeZ97VEmdDr/KsbV4ixiPsMVgGFnt
-PphZ1+pPN19BZrf1xHQNNdLom5HCvrp00VLkjSTawZ0+gzUwK3G748UqerVN7hYp
-T1lw30IsCwKBgFwIfhM3X3pmzehIhXixV6DFYBzFTwF1tGUwA8qrb2l2tfesBuy2
-uWss/Czg+nNrXXhAyk9hmpu5kUocwsOBYue1HIv26F35fOSuxbxeup3dQJTnxQ5/
-c7b674RanasGqvn4w3VC7ThlKDRDdXTH1bRMF3FVxchSrh7/2eb5HnpxAoGBAKt5
-Tj1wqJGPB6Lo4bUz4imiNFdGQ7q1t5NNLdgChA1VOZcSrjjJX4wnQ27zNEoOtIsF
-k5ul2zTjlu55Eg0HDDlx0UqYOGntmTJCW8qyGWiI1/AbOjIHPUozYGkXQfys9Bqa
-iByE19p85JtXomHk9nSyM87IdhgiyQAbGtf895xpAoGBAOvuo82VtFhTtwnY4cZa
-bfe0mMxzah2CDW/R26Xy/ebWGuvViOC/ZlEEraPzn5qzVyTrwJtdiUxKlhsfvTU4
-JCkx7De8dBkAppcZxcDEveAeJAw+jD9iaYVhMvzFYv5n4KstRjTRq7goa4VqLZvf
-Cd81ZTvShf17t/BbGA6jn8qW
------END PRIVATE KEY-----
-)EOF";
-
-// Cheia publica RSA a bancii — folosita la criptarea PIN block-ului
-const char bank_pub_pem[] = R"EOF(
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuSgizMI8t3KubCl188XN
-IiT8kZq9e6Y/k2BlXvkFmxhIGua08Znle9TbjI8oIVpsZP9kQmv5XQcMqxWi0uLE
-IxyksztOCkro6OwU20NeHMwIQrCeKVekZNRJKVTo3ULqr8XvE9golHX4RSNXS81H
-py5CljY7PXgGoCIWN7mdC8fbBhjus66HhaHBugrLsVma5j9zEMNKqySApH2ABYf2
-Z68yVtOneb9rPgcebk8owzmprvyOvzTa1setswqPrdr7R7TQnp/7jLvtUEmyMck8
-1takct2t0TKNjahe+3Xi2eXVCunpqLi0Djnm5YkhnyhcjppAL7nnn3QlDnAYoq0K
-hQIDAQAB
------END PUBLIC KEY-----
-)EOF";
+// IMPORTANT: Certificatele NU mai sunt hardcodate in cod.
+// Ele sunt stocate criptat in NVS (Non-Volatile Storage) si
+// provizionate o singura data prin sketch-ul ESP32_code/provisioning/main.cpp
+// + scriptul scripts/provision_esp32.py.
+//
+// La boot, main.cpp le citeste din NVS. Daca NVS e gol,
+// terminalul se blocheaza si afiseaza "Provisioning necesar!".
+//
+// Avantaje:
+//   - Niciun secret in codul sursa (GitHub-safe)
+//   - Reinnoire PKI automata via /api/pki/renew scrie direct in NVS
+//   - Scalabil: acelasi firmware pe 50 de terminale, doar provisioning-ul difera
+//   - Cheia privata nu e niciodata vizibila in cod
 
 // Cheie AES-GCM pentru NVS (provisionata securizat; schimba in productie)
 static const uint8_t CERT_ENC_KEY[32] = {
@@ -278,6 +184,7 @@ const unsigned long PHONE_WAIT_TIMEOUT_MS = 30000UL;
 String current_client_cert_pem;
 String current_client_key_pem;
 String current_root_ca_pem;
+String current_bank_pub_pem;
 String g_terminalId;
 DeviceState g_deviceState = STATE_OK;
 PendingTransaction g_tx;
@@ -327,6 +234,7 @@ bool aesGcmDecrypt(const uint8_t *key, const uint8_t *iv, size_t iv_len,
                    size_t tag_len, uint8_t *output);
 void fillRandomBytes(uint8_t *buffer, size_t length);
 void setupLocalServer();
+void dumpCertificateDiagnostics();
 
 // ============================================================
 // UTILITARE HARDWARE
@@ -404,16 +312,16 @@ bool isHexString(const String &value) {
 // ============================================================
 
 // 16-bit RGB565 Modern Palette
-#define COLOR_BG        0x0842  // Foarte închis, albastru-gri (Deep Slate Blue)
-#define COLOR_CARD      0x18C7  // Albastru-gri mediu închis (Sleek Card)
-#define COLOR_ACCENT    0x3DFF  // Cyan/Albastru Neon vibrant (Accent)
+#define COLOR_BG 0x0842         // Foarte închis, albastru-gri (Deep Slate Blue)
+#define COLOR_CARD 0x18C7       // Albastru-gri mediu închis (Sleek Card)
+#define COLOR_ACCENT 0x3DFF     // Cyan/Albastru Neon vibrant (Accent)
 #define COLOR_TEXT_MAIN 0xFFFF  // Alb pur
 #define COLOR_TEXT_MUTED 0xBDF7 // Gri deschis / muted
-#define COLOR_GREEN     0x2E66  // Verde smarald premium (Emerald Success)
-#define COLOR_RED       0xD144  // Roșu chihlimbar/stins (Crimson Error)
-#define COLOR_YELLOW    0xFDE0  // Galben chihlimbar (Amber/Gold)
+#define COLOR_GREEN 0x2E66      // Verde smarald premium (Emerald Success)
+#define COLOR_RED 0xD144        // Roșu chihlimbar/stins (Crimson Error)
+#define COLOR_YELLOW 0xFDE0     // Galben chihlimbar (Amber/Gold)
 
-void drawHeaderAndFooter(const char* state_str) {
+void drawHeaderAndFooter(const char *state_str) {
   // Top Header
   tft.fillRect(0, 0, 320, 30, COLOR_CARD);
   tft.setTextColor(COLOR_ACCENT);
@@ -455,25 +363,26 @@ void drawHeaderAndFooter(const char* state_str) {
 
 void showMessage(const char *line1, const char *line2) {
   // 1. Boot / Setup Screen
-  if (line1 && (strstr(line1, "Pornire") || strstr(line1, "WiFi") || strstr(line1, "NTP") || strstr(line1, "Cert"))) {
+  if (line1 && (strstr(line1, "Pornire") || strstr(line1, "WiFi") ||
+                strstr(line1, "NTP") || strstr(line1, "Cert"))) {
     tft.fillScreen(COLOR_BG);
     drawHeaderAndFooter("SETUP");
-    
+
     tft.fillRoundRect(20, 50, 280, 140, 8, COLOR_CARD);
     tft.drawRoundRect(20, 50, 280, 140, 8, COLOR_ACCENT);
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(2);
     tft.setCursor(40, 80);
     tft.print(line1);
-    
+
     if (line2 && strlen(line2) > 0) {
       tft.setTextColor(COLOR_TEXT_MUTED);
       tft.setTextSize(1);
       tft.setCursor(40, 120);
       tft.print(line2);
     }
-    
+
     tft.drawRoundRect(40, 150, 240, 10, 3, COLOR_BG);
     tft.fillRoundRect(42, 152, 120, 6, 2, COLOR_ACCENT);
     return;
@@ -483,15 +392,15 @@ void showMessage(const char *line1, const char *line2) {
   if (line1 && strcmp(line1, "Gata de plata") == 0) {
     tft.fillScreen(COLOR_BG);
     drawHeaderAndFooter("IDLE");
-    
+
     tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
     tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_ACCENT);
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(2);
     tft.setCursor(75, 80);
     tft.print("GATA DE PLATA");
-    
+
     tft.setTextColor(COLOR_TEXT_MUTED);
     tft.setTextSize(1);
     tft.setCursor(45, 120);
@@ -508,15 +417,15 @@ void showMessage(const char *line1, const char *line2) {
   // 3. Blocked State Screen
   if (line1 && strcmp(line1, "Terminal BLOCAT") == 0) {
     tft.fillScreen(COLOR_RED);
-    
+
     tft.fillRoundRect(30, 40, 260, 160, 8, COLOR_BG);
     tft.drawRoundRect(30, 40, 260, 160, 8, COLOR_RED);
-    
+
     tft.setTextColor(COLOR_RED);
     tft.setTextSize(2);
     tft.setCursor(70, 70);
     tft.print("TERMINAL BLOCAT");
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(1);
     tft.setCursor(50, 115);
@@ -529,27 +438,29 @@ void showMessage(const char *line1, const char *line2) {
   }
 
   // 4. PIN Entry Screen
-  if (line1 && (strcmp(line1, "Introdu PIN:") == 0 || strcmp(line1, "PIN necesar") == 0)) {
+  if (line1 && (strcmp(line1, "Introdu PIN:") == 0 ||
+                strcmp(line1, "PIN necesar") == 0)) {
     tft.fillScreen(COLOR_BG);
     drawHeaderAndFooter("SECURITY");
-    
+
     tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
     tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_YELLOW);
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(2);
     tft.setCursor(85, 70);
     tft.print("INTRODU PIN");
-    
+
     tft.drawRoundRect(60, 105, 200, 36, 6, COLOR_BG);
-    
+
     int pin_len = 0;
     if (line2) {
       for (size_t i = 0; i < strlen(line2); i++) {
-        if (line2[i] == '*') pin_len++;
+        if (line2[i] == '*')
+          pin_len++;
       }
     }
-    
+
     int start_x = 95;
     for (int i = 0; i < 4; i++) {
       if (i < pin_len) {
@@ -558,7 +469,7 @@ void showMessage(const char *line1, const char *line2) {
         tft.drawCircle(start_x + i * 40, 123, 8, COLOR_TEXT_MUTED);
       }
     }
-    
+
     tft.setTextColor(COLOR_TEXT_MUTED);
     tft.setTextSize(1);
     tft.setCursor(65, 160);
@@ -569,12 +480,12 @@ void showMessage(const char *line1, const char *line2) {
   // 5. Success Screen
   if (line2 && strcmp(line2, "APROBAT") == 0) {
     tft.fillScreen(COLOR_GREEN);
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(3);
     tft.setCursor(95, 60);
     tft.print("APROBAT");
-    
+
     // Draw huge checkmark
     tft.drawLine(120, 130, 150, 160, COLOR_TEXT_MAIN);
     tft.drawLine(120, 131, 150, 161, COLOR_TEXT_MAIN);
@@ -582,7 +493,7 @@ void showMessage(const char *line1, const char *line2) {
     tft.drawLine(150, 160, 210, 90, COLOR_TEXT_MAIN);
     tft.drawLine(150, 161, 210, 91, COLOR_TEXT_MAIN);
     tft.drawLine(150, 162, 210, 92, COLOR_TEXT_MAIN);
-    
+
     tft.setTextSize(2);
     tft.setCursor(55, 185);
     tft.print("Plata finalizata!");
@@ -590,23 +501,26 @@ void showMessage(const char *line1, const char *line2) {
   }
 
   // 6. Declined or Error Screen
-  if (line2 && (strcmp(line2, "REFUZAT") == 0 || strstr(line2, "refuzat") || strstr(line2, "insuf") || strstr(line2, "blocat") || strstr(line2, "Eroare") || strstr(line2, "Timeout") || strstr(line2, "Err:"))) {
+  if (line2 && (strcmp(line2, "REFUZAT") == 0 || strstr(line2, "refuzat") ||
+                strstr(line2, "insuf") || strstr(line2, "blocat") ||
+                strstr(line2, "Eroare") || strstr(line2, "Timeout") ||
+                strstr(line2, "Err:"))) {
     tft.fillScreen(COLOR_RED);
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(3);
     tft.setCursor(95, 50);
     tft.print("REFUZAT");
-    
+
     tft.fillRoundRect(30, 100, 260, 90, 8, COLOR_BG);
     tft.drawRoundRect(30, 100, 260, 90, 8, COLOR_TEXT_MAIN);
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(2);
     int text_x = 160 - (strlen(line2) * 6);
     tft.setCursor(text_x > 40 ? text_x : 40, 125);
     tft.print(line2);
-    
+
     tft.setTextColor(COLOR_TEXT_MUTED);
     tft.setTextSize(1);
     tft.setCursor(65, 165);
@@ -621,25 +535,25 @@ void showMessage(const char *line1, const char *line2) {
       is_amount_screen = true;
     }
   }
-  
+
   if (is_amount_screen) {
     tft.fillScreen(COLOR_BG);
     drawHeaderAndFooter("PAYMENT");
-    
+
     tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
     tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_ACCENT);
-    
+
     tft.setTextColor(COLOR_TEXT_MUTED);
     tft.setTextSize(1);
     tft.setCursor(110, 65);
     tft.print("SUMA DE PLATA");
-    
+
     tft.setTextColor(COLOR_TEXT_MAIN);
     tft.setTextSize(3);
     int amt_x = 160 - (strlen(line1) * 9);
     tft.setCursor(amt_x > 30 ? amt_x : 30, 88);
     tft.print(line1);
-    
+
     if (line2 && strcmp(line2, "Procesare...") == 0) {
       tft.fillRoundRect(40, 135, 240, 35, 6, COLOR_YELLOW);
       tft.setTextColor(COLOR_BG);
@@ -660,15 +574,15 @@ void showMessage(const char *line1, const char *line2) {
   // 8. General Info Fallback
   tft.fillScreen(COLOR_BG);
   drawHeaderAndFooter("INFO");
-  
+
   tft.fillRoundRect(20, 50, 280, 145, 8, COLOR_CARD);
   tft.drawRoundRect(20, 50, 280, 145, 8, COLOR_ACCENT);
-  
+
   tft.setTextColor(COLOR_TEXT_MAIN);
   tft.setTextSize(2);
   tft.setCursor(40, 80);
   tft.print(line1);
-  
+
   if (line2 && strlen(line2) > 0) {
     tft.setTextColor(COLOR_TEXT_MUTED);
     tft.setTextSize(1);
@@ -882,7 +796,7 @@ int computeBackoffMs(int attempt, int base_delay, int cap_delay) {
 }
 
 bool isRetryableStatus(int httpCode) {
-  return httpCode == 429 || httpCode == 503 || httpCode <= 0;
+  return httpCode == 409 || httpCode == 429 || httpCode == 503 || httpCode <= 0;
 }
 
 String jsonGetString(const JsonVariantConst &value) {
@@ -961,6 +875,210 @@ String getTerminalId() {
   }
   g_terminalId = "POS-" + generateUuidV4();
   return g_terminalId;
+}
+
+// ============================================================
+// DIAGNOSTIC TLS/mTLS — Dump complet certificate + verificare lant
+//
+// Aceasta functie parseaza cu mbedtls CA root, certificatul client,
+// si cheia privata client. Afiseaza Subject, Issuer, date de
+// validitate, tip/dimensiune cheie, si verifica manual daca:
+//   1. CA root-ul poate valida certificatul client (chain)
+//   2. Datele de validitate sunt corecte vs ceasul curent
+//   3. Cheia privata se potriveste cu certificatul client
+// ============================================================
+
+void dumpCertificateDiagnostics() {
+  Serial.println("\n╔══════════════════════════════════════════════════════╗");
+  Serial.println("║         DIAGNOSTIC TLS/mTLS — CERTIFICATE            ║");
+  Serial.println("╚══════════════════════════════════════════════════════╝");
+
+  // ── 1. Parsare si afisare CA Root ──────────────────────────
+  mbedtls_x509_crt ca_crt;
+  mbedtls_x509_crt_init(&ca_crt);
+  int ret_ca = mbedtls_x509_crt_parse(
+      &ca_crt, (const unsigned char *)current_root_ca_pem.c_str(),
+      current_root_ca_pem.length() + 1);
+
+  Serial.println("\n── CA ROOT ──────────────────────────────────────────");
+  if (ret_ca != 0) {
+    Serial.printf("[DIAG] EROARE parsare CA root: -0x%04X\n", -ret_ca);
+    Serial.println("[DIAG] CA PEM primii 80 chars:");
+    Serial.println(current_root_ca_pem.substring(0, 80));
+  } else {
+    char buf[512];
+    mbedtls_x509_dn_gets(buf, sizeof(buf), &ca_crt.subject);
+    Serial.printf("[DIAG] CA Subject : %s\n", buf);
+    mbedtls_x509_dn_gets(buf, sizeof(buf), &ca_crt.issuer);
+    Serial.printf("[DIAG] CA Issuer  : %s\n", buf);
+    Serial.printf("[DIAG] CA Valid   : %04d-%02d-%02d → %04d-%02d-%02d\n",
+                  ca_crt.valid_from.year, ca_crt.valid_from.mon,
+                  ca_crt.valid_from.day, ca_crt.valid_to.year,
+                  ca_crt.valid_to.mon, ca_crt.valid_to.day);
+    Serial.printf("[DIAG] CA Self-signed: %s\n",
+                  (ca_crt.issuer_raw.len == ca_crt.subject_raw.len &&
+                   memcmp(ca_crt.issuer_raw.p, ca_crt.subject_raw.p,
+                          ca_crt.issuer_raw.len) == 0)
+                      ? "DA"
+                      : "NU");
+    size_t key_bits = mbedtls_pk_get_bitlen(&ca_crt.pk);
+    Serial.printf("[DIAG] CA Key     : %s %d bits\n",
+                  mbedtls_pk_get_name(&ca_crt.pk), (int)key_bits);
+  }
+
+  // ── 2. Parsare si afisare Client Cert ──────────────────────
+  mbedtls_x509_crt cli_crt;
+  mbedtls_x509_crt_init(&cli_crt);
+  int ret_cli = mbedtls_x509_crt_parse(
+      &cli_crt, (const unsigned char *)current_client_cert_pem.c_str(),
+      current_client_cert_pem.length() + 1);
+
+  Serial.println("\n── CLIENT CERT ─────────────────────────────────────");
+  if (ret_cli != 0) {
+    Serial.printf("[DIAG] EROARE parsare Client cert: -0x%04X\n", -ret_cli);
+  } else {
+    char buf[512];
+    mbedtls_x509_dn_gets(buf, sizeof(buf), &cli_crt.subject);
+    Serial.printf("[DIAG] Client Subject : %s\n", buf);
+    mbedtls_x509_dn_gets(buf, sizeof(buf), &cli_crt.issuer);
+    Serial.printf("[DIAG] Client Issuer  : %s\n", buf);
+    Serial.printf("[DIAG] Client Valid   : %04d-%02d-%02d → %04d-%02d-%02d\n",
+                  cli_crt.valid_from.year, cli_crt.valid_from.mon,
+                  cli_crt.valid_from.day, cli_crt.valid_to.year,
+                  cli_crt.valid_to.mon, cli_crt.valid_to.day);
+    size_t key_bits = mbedtls_pk_get_bitlen(&cli_crt.pk);
+    Serial.printf("[DIAG] Client Key     : %s %d bits\n",
+                  mbedtls_pk_get_name(&cli_crt.pk), (int)key_bits);
+  }
+
+  // ── 3. Parsare Client Private Key ──────────────────────────
+  Serial.println("\n── CLIENT KEY ──────────────────────────────────────");
+  mbedtls_pk_context cli_pk;
+  mbedtls_pk_init(&cli_pk);
+  int ret_key = mbedtls_pk_parse_key(
+      &cli_pk, (const unsigned char *)current_client_key_pem.c_str(),
+      current_client_key_pem.length() + 1, NULL, 0);
+  if (ret_key != 0) {
+    Serial.printf("[DIAG] EROARE parsare Client key: -0x%04X\n", -ret_key);
+  } else {
+    Serial.printf("[DIAG] Key Type   : %s\n", mbedtls_pk_get_name(&cli_pk));
+    Serial.printf("[DIAG] Key Size   : %d bits\n",
+                  (int)mbedtls_pk_get_bitlen(&cli_pk));
+    // Verificam potrivirea key-cert
+    if (ret_cli == 0) {
+      if (mbedtls_pk_get_bitlen(&cli_pk) ==
+              mbedtls_pk_get_bitlen(&cli_crt.pk) &&
+          mbedtls_pk_get_type(&cli_pk) ==
+              mbedtls_pk_get_type(&cli_crt.pk)) {
+        Serial.println("[DIAG] Key-Cert Match : DA (acelasi tip si dimensiune)");
+      } else {
+        Serial.println("[DIAG] Key-Cert Match : NU! Tip sau dimensiune diferita!");
+      }
+    }
+  }
+  mbedtls_pk_free(&cli_pk);
+
+  // ── 4. Verificare manuala lant CA → Client ──────────────────
+  Serial.println("\n── VERIFICARE LANT CA → CLIENT ─────────────────────");
+  if (ret_ca == 0 && ret_cli == 0) {
+    uint32_t flags = 0;
+    int ret_verify = mbedtls_x509_crt_verify(&cli_crt, &ca_crt, NULL, NULL,
+                                              &flags, NULL, NULL);
+    if (ret_verify == 0) {
+      Serial.println("[DIAG] ✓ Verificare REUSITA: CA root-ul valideaza "
+                     "certificatul client.");
+    } else {
+      Serial.printf("[DIAG] ✗ Verificare ESUATA! ret=-0x%04X flags=0x%08lX\n",
+                    -ret_verify, (unsigned long)flags);
+      char vrfy_buf[512];
+      mbedtls_x509_crt_verify_info(vrfy_buf, sizeof(vrfy_buf), "  ! ", flags);
+      Serial.println("[DIAG] Detalii verificare:");
+      Serial.println(vrfy_buf);
+
+      // Decodificam flagurile individual
+      if (flags & MBEDTLS_X509_BADCERT_EXPIRED)
+        Serial.println("[DIAG]   → Certificat EXPIRAT");
+      if (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED)
+        Serial.println("[DIAG]   → Certificat NU ESTE DE INCREDERE (issuer "
+                       "mismatch!)");
+      if (flags & MBEDTLS_X509_BADCERT_FUTURE)
+        Serial.println("[DIAG]   → Certificat NOT YET VALID (viitor)");
+      if (flags & MBEDTLS_X509_BADCRL_EXPIRED)
+        Serial.println("[DIAG]   → CRL expirat");
+      if (flags & MBEDTLS_X509_BADCERT_BAD_KEY)
+        Serial.println("[DIAG]   → Cheie invalida");
+      if (flags & MBEDTLS_X509_BADCERT_BAD_MD)
+        Serial.println("[DIAG]   → Algoritm hash slab");
+    }
+  } else {
+    Serial.println("[DIAG] Nu se poate verifica — eroare la parsare CA sau "
+                   "Client cert.");
+  }
+
+  // ── 5. Verificare ceas sistem vs certificate ────────────────
+  Serial.println("\n── CEAS SISTEM VS CERTIFICATE ──────────────────────");
+  time_t now = time(NULL);
+  char tbuf[30];
+  strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+  Serial.printf("[DIAG] Timp sistem UTC : %s (epoch: %ld)\n", tbuf,
+                (long)now);
+
+  if (ret_ca == 0) {
+    time_t ca_from = mbedtlsX509TimeToTimeT(ca_crt.valid_from);
+    time_t ca_to = mbedtlsX509TimeToTimeT(ca_crt.valid_to);
+    Serial.printf("[DIAG] CA valid window : %ld → %ld\n", (long)ca_from,
+                  (long)ca_to);
+    if (now < ca_from)
+      Serial.println("[DIAG] ⚠ Ceasul e INAINTE de validitatea CA!");
+    else if (now > ca_to)
+      Serial.println("[DIAG] ⚠ CA-ul a EXPIRAT!");
+    else
+      Serial.println("[DIAG] ✓ Ceasul este in fereastra de validitate a CA.");
+  }
+
+  if (ret_cli == 0) {
+    time_t cli_from = mbedtlsX509TimeToTimeT(cli_crt.valid_from);
+    time_t cli_to = mbedtlsX509TimeToTimeT(cli_crt.valid_to);
+    Serial.printf("[DIAG] Client valid    : %ld → %ld\n", (long)cli_from,
+                  (long)cli_to);
+    double days_left = difftime(cli_to, now) / 86400.0;
+    Serial.printf("[DIAG] Client zile ramase: %.2f\n", days_left);
+    if (now < cli_from)
+      Serial.println("[DIAG] ⚠ Ceasul e INAINTE de validitatea Client cert!");
+    else if (now > cli_to)
+      Serial.println("[DIAG] ⚠ Client cert EXPIRAT!");
+    else
+      Serial.println(
+          "[DIAG] ✓ Client cert valid la momentul curent.");
+  }
+
+  // ── 6. Fingerprint SHA-256 CA (primii 8 bytes) ─────────────
+  if (ret_ca == 0) {
+    Serial.println("\n── CA FINGERPRINT (SHA-256, primii 16 hex) ─────────");
+    uint8_t hash[32];
+    mbedtls_sha256(ca_crt.raw.p, ca_crt.raw.len, hash, 0);
+    char fp[48];
+    for (int i = 0; i < 8; i++)
+      snprintf(fp + i * 3, 4, "%02X:", hash[i]);
+    fp[23] = '\0';
+    Serial.printf("[DIAG] CA SHA256: %s\n", fp);
+  }
+
+  // ── 7. Info conexiune target ────────────────────────────────
+  Serial.println("\n── TARGET GATEWAY ──────────────────────────────────");
+  Serial.printf("[DIAG] Host : %s\n", gateway_host);
+  Serial.printf("[DIAG] Port : %d\n", gateway_port);
+  Serial.printf("[DIAG] Path : %s\n", gateway_path);
+
+  mbedtls_x509_crt_free(&cli_crt);
+  mbedtls_x509_crt_free(&ca_crt);
+
+  Serial.println("\n══════════════════════════════════════════════════════");
+  Serial.println("[DIAG] Diagnostic complet. Daca CA → Client este OK,");
+  Serial.println("       dar TLS tot esueaza, problema este ca NGINX");
+  Serial.println("       prezinta un certificat SERVER semnat de alt CA.");
+  Serial.println("       Verificati ca nginx.conf foloseste acelasi CA!");
+  Serial.println("══════════════════════════════════════════════════════\n");
 }
 
 bool generateCsrBase64(String &out_csr_base64, String &out_priv_key_pem) {
@@ -1155,8 +1273,14 @@ String encryptPinBlockAndBase64(const String &transaction_id,
 
   mbedtls_pk_context pk;
   mbedtls_pk_init(&pk);
+  if (current_bank_pub_pem.length() == 0) {
+    Serial.println("[PIN] EROARE: bank_pub_pem nu este incarcat din NVS!");
+    mbedtls_pk_free(&pk);
+    return String();
+  }
   int ret = mbedtls_pk_parse_public_key(
-      &pk, (const unsigned char *)bank_pub_pem, strlen(bank_pub_pem) + 1);
+      &pk, (const unsigned char *)current_bank_pub_pem.c_str(),
+      current_bank_pub_pem.length() + 1);
   if (ret != 0) {
     mbedtls_pk_free(&pk);
     return String();
@@ -1288,6 +1412,20 @@ int sendChallengeRequestWithPin(const String &transaction_id,
     int code = http.POST(body);
     String resp = http.getString();
     Serial.printf("[CHALLENGE] attempt=%d code=%d\n", attempt, code);
+    
+    int server_retry_after_ms = -1;
+    if (code > 0) {
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, resp);
+      if (!err) {
+        if (doc["retry_after_ms"].is<int>()) {
+          server_retry_after_ms = doc["retry_after_ms"].as<int>();
+        } else if (doc["detail"]["retry_after_ms"].is<int>()) {
+          server_retry_after_ms = doc["detail"]["retry_after_ms"].as<int>();
+        }
+      }
+    }
+    
     http.end();
 
     if (code == 200 || code == 400 || code == 403)
@@ -1297,6 +1435,10 @@ int sendChallengeRequestWithPin(const String &transaction_id,
       if (attempt == max_retries)
         return code;
       int wait = computeBackoffMs(attempt, base_delay, cap_delay);
+      if (server_retry_after_ms > 0 && server_retry_after_ms > wait) {
+        Serial.printf("[CHALLENGE] Override delay cu retry_after_ms recomandat de server: %d ms (jitter-ul calculat era %d ms)\n", server_retry_after_ms, wait);
+        wait = server_retry_after_ms;
+      }
       Serial.printf("[CHALLENGE] retry in %d ms\n", wait);
       delay(wait);
       continue;
@@ -1321,7 +1463,8 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
 
   if (g_deviceState == STATE_BRICKED_PENDING_MANUAL_RESET) {
     showMessage("Terminal BLOCAT", "Reset necesar");
-    Serial.println("[DEBUG-AUTH] Eroare: Terminalul este blocat de securitate. Apelul de autorizare a fost anulat.");
+    Serial.println("[DEBUG-AUTH] Eroare: Terminalul este blocat de securitate. "
+                   "Apelul de autorizare a fost anulat.");
     return;
   }
 
@@ -1330,13 +1473,15 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
   String terminalId = getTerminalId();
 
   Serial.println("\n=======================================================");
-  Serial.printf("[DEBUG-AUTH] Initiere tranzactie de %d.%02d RON\n", amountCents / 100, amountCents % 100);
+  Serial.printf("[DEBUG-AUTH] Initiere tranzactie de %d.%02d RON\n",
+                amountCents / 100, amountCents % 100);
   Serial.printf("[DEBUG-AUTH] Terminal ID: %s\n", terminalId.c_str());
   Serial.printf("[DEBUG-AUTH] Idempotency Key: %s\n", idempotencyKey.c_str());
   Serial.printf("[DEBUG-AUTH] Payload JSON:\n%s\n", payload.c_str());
   Serial.println("=======================================================");
 
   for (int attempt = 0; attempt <= max_retries; ++attempt) {
+    int server_retry_after_ms = -1;
     HTTPClient http;
     secureClient.setTimeout(HTTP_TIMEOUT_MS);
     http.setTimeout(HTTP_TIMEOUT_MS);
@@ -1346,17 +1491,58 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
     http.addHeader("X-Terminal-Id", terminalId);
 
     showTransaction(amountCents, "Procesare...");
-    Serial.printf("[DEBUG-AUTH] [Incercarea %d/%d] Se trimite POST la %s:%d%s...\n", 
-                  attempt + 1, max_retries + 1, gateway_host, gateway_port, gateway_path);
-                  
+    Serial.printf(
+        "[DEBUG-AUTH] [Incercarea %d/%d] Se trimite POST la %s:%d%s...\n",
+        attempt + 1, max_retries + 1, gateway_host, gateway_port, gateway_path);
+
+    // Diagnostic: afisam timpul curent inainte de TLS handshake
+    // Daca time_t < 1000000000, inseamna ca NTP a esuat si mbedTLS va
+    // respinge certificatul NGINX cu X509_CERT_VERIFY_FAILED (-9984)
+    time_t pre_tls_time = time(NULL);
+    Serial.printf("[DEBUG-AUTH] Ceas sistem inainte de TLS: %ld (%s)\n",
+                  (long)pre_tls_time,
+                  pre_tls_time > 1000000000 ? "VALID" : "INVALID — EPOCH 1970!");
+    if (pre_tls_time > 1000000000) {
+      char tbuf[30];
+      strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&pre_tls_time));
+      Serial.printf("[DEBUG-AUTH] Timp UTC: %s\n", tbuf);
+    }
+
+    // Verificare rapida ca certificatele sunt inca configurate
+    Serial.printf("[DEBUG-AUTH] CA PEM loaded: %d bytes\n",
+                  (int)current_root_ca_pem.length());
+    Serial.printf("[DEBUG-AUTH] Client cert loaded: %d bytes\n",
+                  (int)current_client_cert_pem.length());
+    Serial.printf("[DEBUG-AUTH] Client key loaded: %d bytes\n",
+                  (int)current_client_key_pem.length());
+    if (current_root_ca_pem.length() == 0 ||
+        current_client_cert_pem.length() == 0 ||
+        current_client_key_pem.length() == 0) {
+      Serial.println("[DEBUG-AUTH] ⚠ EROARE CRITICA: Certificate goale!");
+    }
+
     int httpCode = http.POST(payload);
     String body = http.getString();
-    
-    Serial.printf("[DEBUG-AUTH] [Incercarea %d/%d] Cod raspuns HTTP: %d\n", attempt + 1, max_retries + 1, httpCode);
+
+    Serial.printf("[DEBUG-AUTH] [Incercarea %d/%d] Cod raspuns HTTP: %d\n",
+                  attempt + 1, max_retries + 1, httpCode);
     if (httpCode > 0) {
       Serial.printf("[DEBUG-AUTH] Corp raspuns: %s\n", body.c_str());
     } else {
-      Serial.printf("[DEBUG-AUTH] Eroare retea / Timeout! (%s)\n", http.errorToString(httpCode).c_str());
+      Serial.printf("[DEBUG-AUTH] Eroare retea / Timeout! (%s)\n",
+                    http.errorToString(httpCode).c_str());
+    }
+
+    if (httpCode > 0) {
+      JsonDocument doc;
+      DeserializationError err = deserializeJson(doc, body);
+      if (!err) {
+        if (doc["retry_after_ms"].is<int>()) {
+          server_retry_after_ms = doc["retry_after_ms"].as<int>();
+        } else if (doc["detail"]["retry_after_ms"].is<int>()) {
+          server_retry_after_ms = doc["detail"]["retry_after_ms"].as<int>();
+        }
+      }
     }
 
     bool retryable = false;
@@ -1365,13 +1551,14 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       JsonDocument doc;
       DeserializationError err = deserializeJson(doc, body);
       String status = "";
-      if (!err && doc["status"].is<const char*>())
+      if (!err && doc["status"].is<const char *>())
         status = jsonGetString(doc["status"]);
 
       Serial.printf("[DEBUG-AUTH] Status deserializat: %s\n", status.c_str());
 
       if (status == "APPROVED") {
-        Serial.println("[DEBUG-AUTH] Rezultat: APROBAT de Gateway. Tranzactie reusita!");
+        Serial.println(
+            "[DEBUG-AUTH] Rezultat: APROBAT de Gateway. Tranzactie reusita!");
         showTransaction(amountCents, "APROBAT");
         feedbackPulse();
         http.end();
@@ -1380,7 +1567,8 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
 
       if (status == "DECLINED") {
         String reason = doc["detail"]["error_code"] | "";
-        Serial.printf("[DEBUG-AUTH] Rezultat: REFUZAT de Gateway. Motiv: %s\n", reason.c_str());
+        Serial.printf("[DEBUG-AUTH] Rezultat: REFUZAT de Gateway. Motiv: %s\n",
+                      reason.c_str());
         if (reason == "INSUFFICIENT_FUNDS")
           showTransaction(amountCents, "Fonduri insuf.");
         else
@@ -1392,51 +1580,76 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       if (status == "CHALLENGE_REQUIRED") {
         String tx_id = doc["transaction_id"] | "";
         String orig_dpan = doc["original_dpan"] | "";
+        if (orig_dpan.length() == 0) {
+          orig_dpan = g_tx.dpan;
+        }
         http.end();
 
-        Serial.printf("[DEBUG-AUTH] Rezultat: CHALLENGE_REQUIRED. Tx ID: %s\n", tx_id.c_str());
+        Serial.printf("[DEBUG-AUTH] Rezultat: CHALLENGE_REQUIRED. Tx ID: %s\n",
+                      tx_id.c_str());
 
         if (tx_id.length() == 0 || orig_dpan.length() == 0) {
-          Serial.println("[DEBUG-AUTH] Eroare: Datele de challenge lipsesc din raspuns 200!");
+          Serial.println("[DEBUG-AUTH] Eroare: Datele de challenge lipsesc din "
+                         "raspuns 200!");
           showMessage("Eroare challenge", "Date lipsa");
           return;
         }
-        showMessage("PIN necesar", "Conf. cu #");
-        Serial.println("[DEBUG-AUTH] Se asteapta introducerea PIN-ului pe tastatura...");
-        String pin = collectPin(PIN_MAX_DIGITS, 30000);
-        if ((int)pin.length() < PIN_MIN_LENGTH) {
-          Serial.println("[DEBUG-AUTH] Timeout PIN sau PIN prea scurt!");
-          showMessage("Timeout PIN", nullptr);
-          return;
-        }
-        
-        Serial.println("[DEBUG-AUTH] PIN colectat cu succes. Se trimite cerere challenge la gateway...");
-        int challCode = sendChallengeRequestWithPin(tx_id, orig_dpan, pin);
-        Serial.printf("[DEBUG-AUTH] Cod raspuns challenge de la gateway: %d\n", challCode);
-        
-        if (challCode == 200) {
-          Serial.println("[DEBUG-AUTH] Challenge REUSIT! Tranzactie aprobata.");
-          showTransaction(amountCents, "APROBAT");
-          feedbackPulse();
-          return;
-        } else if (challCode == 400) {
-          Serial.println("[DEBUG-AUTH] Challenge ESUAT: PIN incorect!");
-          showMessage("PIN incorect", "Reincercati");
-          return;
-        } else if (challCode == 403) {
-          Serial.println("[DEBUG-AUTH] Challenge ESUAT: Card blocat!");
-          showMessage("Card blocat", "Contact banca");
-          return;
-        } else {
-          retryable = isRetryableStatus(challCode);
-          Serial.printf("[DEBUG-AUTH] Challenge eroare sistem. Retryable: %s\n", retryable ? "DA" : "NU");
-          if (!retryable) {
-            showTransaction(amountCents, "Eroare PIN");
+        int pin_attempts = 0;
+
+        while (pin_attempts < 3) {
+          if (pin_attempts > 0) {
+            char attempt_msg[32];
+            snprintf(attempt_msg, sizeof(attempt_msg), "Incercarea %d/3", pin_attempts + 1);
+            showMessage("PIN incorect", attempt_msg);
+            delay(2000);
+          }
+          showMessage("PIN necesar", "Conf. cu #");
+          Serial.printf("[DEBUG-AUTH] Se asteapta introducerea PIN-ului pe tastatura (incercarea %d/3)...\n", pin_attempts + 1);
+          String pin = collectPin(PIN_MAX_DIGITS, 30000);
+          if ((int)pin.length() < PIN_MIN_LENGTH) {
+            Serial.println("[DEBUG-AUTH] Timeout PIN sau PIN prea scurt!");
+            showMessage("Timeout PIN", nullptr);
+            return;
+          }
+
+          Serial.println("[DEBUG-AUTH] PIN colectat cu succes. Se trimite cerere challenge la gateway...");
+          int challCode = sendChallengeRequestWithPin(tx_id, orig_dpan, pin);
+          Serial.printf("[DEBUG-AUTH] Cod raspuns challenge de la gateway: %d\n", challCode);
+
+          if (challCode == 200) {
+            Serial.println("[DEBUG-AUTH] Challenge REUSIT! Tranzactie aprobata.");
+            showTransaction(amountCents, "APROBAT");
+            feedbackPulse();
+            return; // Terminate function successfully on success
+          } else if (challCode == 400) {
+            Serial.println("[DEBUG-AUTH] Challenge ESUAT: PIN incorect!");
+            pin_attempts++;
+            continue;
+          } else if (challCode == 403) {
+            Serial.println("[DEBUG-AUTH] Challenge ESUAT: Card blocat!");
+            showMessage("Card blocat", "Contact banca");
+            return;
+          } else {
+            retryable = isRetryableStatus(challCode);
+            Serial.printf("[DEBUG-AUTH] Challenge eroare sistem. Retryable: %s\n",
+                          retryable ? "DA" : "NU");
+            if (!retryable) {
+              showTransaction(amountCents, "Eroare PIN");
+              return;
+            }
+            showTransaction(amountCents, "Eroare retea PIN");
             return;
           }
         }
+
+        // Loop finished normally (attempts reached 3 without success)
+        Serial.println("[DEBUG-AUTH] S-au epuizat incercarile de PIN local.");
+        showMessage("PIN incorect", "Card blocat?");
+        return;
       } else {
-        Serial.printf("[DEBUG-AUTH] Avertisment: Status necunoscut in HTTP 200: %s. Se incearca reincercarea tranzactiei.\n", status.c_str());
+        Serial.printf("[DEBUG-AUTH] Avertisment: Status necunoscut in HTTP "
+                      "200: %s. Se incearca reincercarea tranzactiei.\n",
+                      status.c_str());
         retryable = true;
       }
 
@@ -1453,58 +1666,85 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
           original_dpan = jsonGetString(detail["original_dpan"]);
         }
       }
+      if (original_dpan.length() == 0) {
+        original_dpan = g_tx.dpan;
+      }
       http.end();
 
-      Serial.printf("[DEBUG-AUTH] HTTP 401 primiti: CHALLENGE_REQUIRED. Tx ID: %s, DPAN: ...%s\n", 
-                    transaction_id.c_str(), 
-                    original_dpan.substring(max(0, (int)original_dpan.length() - 4)).c_str());
+      Serial.printf(
+          "[DEBUG-AUTH] HTTP 401 primiti: CHALLENGE_REQUIRED. Tx ID: %s, DPAN: "
+          "...%s\n",
+          transaction_id.c_str(),
+          original_dpan.substring(max(0, (int)original_dpan.length() - 4))
+              .c_str());
 
       if (transaction_id.length() == 0 || original_dpan.length() == 0) {
-        Serial.println("[DEBUG-AUTH] Eroare: Datele de challenge lipsesc in raspunsul 401!");
+        Serial.println("[DEBUG-AUTH] Eroare: Datele de challenge lipsesc in "
+                       "raspunsul 401!");
         showMessage("Eroare 401", "Date lipsa");
         return;
       }
-      showMessage("PIN necesar", "Conf. cu #");
-      Serial.println("[DEBUG-AUTH] Se asteapta introducerea PIN-ului pe tastatura...");
-      String pin = collectPin(PIN_MAX_DIGITS, 30000);
-      if ((int)pin.length() < PIN_MIN_LENGTH) {
-        Serial.println("[DEBUG-AUTH] Timeout PIN sau PIN prea scurt!");
-        showMessage("Timeout PIN", nullptr);
-        return;
-      }
-      
-      Serial.println("[DEBUG-AUTH] PIN colectat. Se trimite cererea de challenge la gateway...");
-      int challCode =
-          sendChallengeRequestWithPin(transaction_id, original_dpan, pin);
-      Serial.printf("[DEBUG-AUTH] Cod raspuns challenge de la gateway: %d\n", challCode);
-      
-      if (challCode == 200) {
-        Serial.println("[DEBUG-AUTH] Challenge REUSIT! Tranzactie aprobata.");
-        showTransaction(amountCents, "APROBAT");
-        feedbackPulse();
-        return;
-      } else if (challCode == 400) {
-        Serial.println("[DEBUG-AUTH] Challenge ESUAT: PIN incorect!");
-        showMessage("PIN incorect", "Reincercati");
-        return;
-      } else if (challCode == 403) {
-        Serial.println("[DEBUG-AUTH] Challenge ESUAT: Card blocat!");
-        showMessage("Card blocat", "Contact banca");
-        return;
-      } else {
-        retryable = isRetryableStatus(challCode);
-        Serial.printf("[DEBUG-AUTH] Challenge eroare. Retryable: %s\n", retryable ? "DA" : "NU");
-        if (!retryable) {
-          showTransaction(amountCents, "Eroare PIN");
+      int pin_attempts = 0;
+
+      while (pin_attempts < 3) {
+        if (pin_attempts > 0) {
+          char attempt_msg[32];
+          snprintf(attempt_msg, sizeof(attempt_msg), "Incercarea %d/3", pin_attempts + 1);
+          showMessage("PIN incorect", attempt_msg);
+          delay(2000);
+        }
+        showMessage("PIN necesar", "Conf. cu #");
+        Serial.printf("[DEBUG-AUTH] Se asteapta introducerea PIN-ului pe tastatura (incercarea %d/3)...\n", pin_attempts + 1);
+        String pin = collectPin(PIN_MAX_DIGITS, 30000);
+        if ((int)pin.length() < PIN_MIN_LENGTH) {
+          Serial.println("[DEBUG-AUTH] Timeout PIN sau PIN prea scurt!");
+          showMessage("Timeout PIN", nullptr);
+          return;
+        }
+
+        Serial.println("[DEBUG-AUTH] PIN colectat. Se trimite cererea de challenge la gateway...");
+        int challCode =
+            sendChallengeRequestWithPin(transaction_id, original_dpan, pin);
+        Serial.printf("[DEBUG-AUTH] Cod raspuns challenge de la gateway: %d\n",
+                      challCode);
+
+        if (challCode == 200) {
+          Serial.println("[DEBUG-AUTH] Challenge REUSIT! Tranzactie aprobata.");
+          showTransaction(amountCents, "APROBAT");
+          feedbackPulse();
+          return; // Terminate function successfully on success
+        } else if (challCode == 400) {
+          Serial.println("[DEBUG-AUTH] Challenge ESUAT: PIN incorect!");
+          pin_attempts++;
+          continue;
+        } else if (challCode == 403) {
+          Serial.println("[DEBUG-AUTH] Challenge ESUAT: Card blocat!");
+          showMessage("Card blocat", "Contact banca");
+          return;
+        } else {
+          retryable = isRetryableStatus(challCode);
+          Serial.printf("[DEBUG-AUTH] Challenge eroare. Retryable: %s\n",
+                        retryable ? "DA" : "NU");
+          if (!retryable) {
+            showTransaction(amountCents, "Eroare PIN");
+            return;
+          }
+          showTransaction(amountCents, "Eroare retea PIN");
           return;
         }
       }
+
+      // Loop finished normally (attempts reached 3 without success)
+      Serial.println("[DEBUG-AUTH] S-au epuizat incercarile de PIN local.");
+      showMessage("PIN incorect", "Card blocat?");
+      return;
 
     } else if (httpCode == 400) {
       JsonDocument doc;
       deserializeJson(doc, body);
       String errCode = doc["detail"]["error_code"] | "UNKNOWN";
-      Serial.printf("[DEBUG-AUTH] Eroare definitiva HTTP 400: %s\n", errCode.c_str());
+      Serial.printf("[DEBUG-AUTH] Eroare definitiva HTTP 400: %s\n",
+                    errCode.c_str());
       if (errCode == "INSUFFICIENT_FUNDS")
         showTransaction(amountCents, "Fonduri insuf.");
       else if (errCode == "INVALID_CRYPTOGRAM")
@@ -1521,11 +1761,15 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
       return;
 
     } else if (isRetryableStatus(httpCode)) {
-      Serial.printf("[DEBUG-AUTH] Eroare tranzitorie / temporara: %d. Este posibila reincercarea.\n", httpCode);
+      Serial.printf("[DEBUG-AUTH] Eroare tranzitorie / temporara: %d. Este "
+                    "posibila reincercarea.\n",
+                    httpCode);
       retryable = true;
 
     } else {
-      Serial.printf("[DEBUG-AUTH] Eroare sistem necunoscuta: %d. Corp raspuns: %s\n", httpCode, body.c_str());
+      Serial.printf(
+          "[DEBUG-AUTH] Eroare sistem necunoscuta: %d. Corp raspuns: %s\n",
+          httpCode, body.c_str());
       showTransaction(amountCents, "Eroare sistem");
       http.end();
       return;
@@ -1534,16 +1778,23 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
     http.end();
 
     if (!retryable || attempt == max_retries) {
-      Serial.println("[DEBUG-AUTH] S-au epuizat incercarile sau eroarea nu permite reincercarea.");
+      Serial.println("[DEBUG-AUTH] S-au epuizat incercarile sau eroarea nu "
+                     "permite reincercarea.");
       showTransaction(amountCents, "Eroare sistem");
       return;
     }
 
     int wait = computeBackoffMs(attempt, base_delay, cap_delay);
+    if (server_retry_after_ms > 0 && server_retry_after_ms > wait) {
+      Serial.printf("[DEBUG-AUTH] Override delay cu retry_after_ms recomandat de server: %d ms (jitter-ul calculat era %d ms)\n", server_retry_after_ms, wait);
+      wait = server_retry_after_ms;
+    }
     char buf[32];
     snprintf(buf, sizeof(buf), "Retry %ds", wait / 1000);
     showTransaction(amountCents, buf);
-    Serial.printf("[DEBUG-AUTH] Reincercare in %d ms (Incercarea %d terminata)\n", wait, attempt + 1);
+    Serial.printf(
+        "[DEBUG-AUTH] Reincercare in %d ms (Incercarea %d terminata)\n", wait,
+        attempt + 1);
     delay(wait);
   }
 
@@ -1556,7 +1807,8 @@ void sendRequestWithBackoff(const String &payload, int amountCents) {
 
 bool sendNfcCommand(const uint8_t *command, uint8_t commandLen,
                     uint8_t *response, uint8_t *responseLength) {
-  return nfc.inDataExchange(const_cast<uint8_t*>(command), commandLen, response, responseLength);
+  return nfc.inDataExchange(const_cast<uint8_t *>(command), commandLen,
+                            response, responseLength);
 }
 
 bool appendTlv(uint8_t *buffer, int &offset, uint8_t tag, const uint8_t *value,
@@ -1594,19 +1846,19 @@ bool buildEmvGpoPayload(int amountCents, const String &currency,
 // ============================================================
 // SERVER HTTP LOCAL — WiFi Direct
 //
-// POST /initiate         ← dashboard trimite amount_cents; ESP32 creeaza tranzactia
-// GET  /payment-request  → trimite datele tranzactiei active la telefon
-// POST /payment-response ← primeste DPAN + ATC + MAC de la telefon
+// POST /initiate         ← dashboard trimite amount_cents; ESP32 creeaza
+// tranzactia GET  /payment-request  → trimite datele tranzactiei active la
+// telefon POST /payment-response ← primeste DPAN + ATC + MAC de la telefon
 // ============================================================
 
 void setupLocalServer() {
   // POST /initiate
   // Dashboard-ul (sau aplicatia) initiaza o tranzactie noua cu suma dorita.
   // Body JSON: {"amount_cents": 1500, "currency": "RON"}  (currency optional)
-  // Raspuns: {"status":"OK","pos_nonce":"...","terminal_timestamp":"...","terminal_id":"..."}
+  // Raspuns:
+  // {"status":"OK","pos_nonce":"...","terminal_timestamp":"...","terminal_id":"..."}
   localServer.on(
-      "/initiate", HTTP_POST, [](AsyncWebServerRequest *request) {},
-      nullptr,
+      "/initiate", HTTP_POST, [](AsyncWebServerRequest *request) {}, nullptr,
       [](AsyncWebServerRequest *request, uint8_t *data, size_t len,
          size_t index, size_t total) {
         if (g_tx.state != POS_IDLE) {
@@ -1760,9 +2012,10 @@ void setup() {
   tft.setRotation(1);
   showMessage("Pornire...", nullptr);
 
-  // Initializare NVS — curățăm și resetăm spațiul pentru a preveni NOT_ENOUGH_SPACE
+  // Initializare NVS — resetăm doar contoarele de eroare, NU ștergem
+  // certificatele! prefs.clear() era destructiv: ștergea cert-urile
+  // provizionate/reînnoite la fiecare boot.
   prefs.begin("pki", false);
-  prefs.clear(); // Eliberează tot spațiul fragmentat în namespace-ul pki
   prefs.putInt(RENEW_FAILURES_NVS_KEY, 0);
   prefs.putInt(STATE_NVS_KEY, STATE_OK);
   prefs.end();
@@ -1803,30 +2056,78 @@ void setup() {
     delay(1000);
   }
 
-  // Sincronizare NTP (necesara pentru timestamp ISO 8601 valid in criptograma)
+  // Sincronizare NTP (OBLIGATORIE — fara timp valid, mbedTLS respinge orice
+  // certificat cu BADCERT_FUTURE / X509_CERT_VERIFY_FAILED = -9984)
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   Serial.print("[NTP] Sincronizare");
+  showMessage("NTP Sync...", "Asteptam ceasul");
   time_t now = 0;
-  for (int i = 0; i < 20 && now < 1000000000; i++) {
+  for (int i = 0; i < 60 && now < 1000000000; i++) {
     time(&now);
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-  if (now > 1000000000)
+  if (now > 1000000000) {
     Serial.printf("[NTP] OK — %s", ctime(&now));
-  else
-    Serial.println("[NTP] AVERTISMENT: Timp nesincronizat");
+  } else {
+    Serial.println("[NTP] EROARE CRITICA: Timp nesincronizat dupa 30s!");
+    Serial.printf("[NTP] time(NULL) = %ld — mbedTLS va respinge TOATE certificatele!\n", (long)now);
+    showMessage("NTP EROARE", "Ceas nesincronizat!");
+    // Blocare: fara ceas valid, mTLS nu poate functiona
+    while (true) {
+      // Reincearca NTP la fiecare 10 secunde
+      delay(10000);
+      time(&now);
+      if (now > 1000000000) {
+        Serial.printf("[NTP] Recuperat! Timp: %s", ctime(&now));
+        break;
+      }
+      Serial.printf("[NTP] Inca asteptam... time=%ld\n", (long)now);
+    }
+  }
 
-  // Întotdeauna suprascriem NVS cu certificatele proaspăt compiled pentru a asigura sincronizarea cu CA/Gateway-ul din Docker.
-  current_client_cert_pem = String(client_cert_pem);
-  current_client_key_pem = String(client_key_pem);
-  storeClientCredentialsToNVS(current_client_cert_pem, current_client_key_pem);
-  Serial.println("[mTLS] Certificate proaspete stocate si fortate in NVS");
+  // Citim certificatele din NVS (scrise la provisioning sau PKI renewal)
+  Serial.println("[mTLS] Citire certificate din NVS...");
 
-  current_root_ca_pem = String(root_ca_pem);
-  storeRootCaToNVS(current_root_ca_pem);
-  Serial.println("[mTLS] CA proaspat stocat si fortat in NVS");
+  if (!loadRootCaFromNVS(current_root_ca_pem) ||
+      current_root_ca_pem.length() == 0) {
+    Serial.println("[mTLS] EROARE: CA root lipseste din NVS!");
+    Serial.println("[mTLS] Rulati sketch-ul de provisioning mai intai:");
+    Serial.println("  1. Flash ESP32_code/provisioning/main.cpp");
+    Serial.println("  2. python scripts/provision_esp32.py --port COMx");
+    Serial.println("  3. Re-flash codul principal");
+    showMessage("NVS GOL", "Provisioning necesar!");
+    while (true)
+      delay(1000); // Blocare — nu putem continua fara CA
+  }
+  Serial.printf("[mTLS] CA root incarcat din NVS (%d bytes)\n",
+                current_root_ca_pem.length());
+
+  if (!loadClientCredentialsFromNVS(current_client_cert_pem,
+                                    current_client_key_pem) ||
+      current_client_cert_pem.length() == 0 ||
+      current_client_key_pem.length() == 0) {
+    Serial.println("[mTLS] EROARE: Certificate client lipsesc din NVS!");
+    showMessage("NVS GOL", "Client cert lipseste!");
+    while (true)
+      delay(1000);
+  }
+  Serial.printf("[mTLS] Client cert incarcat din NVS (%d bytes)\n",
+                current_client_cert_pem.length());
+  Serial.printf("[mTLS] Client key incarcat din NVS (%d bytes)\n",
+                current_client_key_pem.length());
+
+  // Bank public key — pentru criptarea PIN block cu cheia bancii
+  if (!loadEncryptedStringFromNVS("bank_pub", current_bank_pub_pem) ||
+      current_bank_pub_pem.length() == 0) {
+    Serial.println(
+        "[mTLS] AVERTISMENT: bank_pub lipseste din NVS — PIN "
+        "challenge nu va functiona!");
+  } else {
+    Serial.printf("[mTLS] Bank pub key incarcata din NVS (%d bytes)\n",
+                  current_bank_pub_pem.length());
+  }
 
   // Configureaza mTLS pe WiFiClientSecure
   secureClient.setCACert(current_root_ca_pem.c_str());
@@ -1840,10 +2141,61 @@ void setup() {
     g_terminalId = getTerminalId();
   Serial.printf("[mTLS] Terminal ID: %s\n", g_terminalId.c_str());
 
-  // NFC — modulul e defect; dezactivat pentru a preveni conflicte de pini cu Keypad, LED si Haptic
-  // SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
-  // nfc.begin();
-  // nfc.SAMConfig();
+  // Dump complet al certificatelor si verificare lant la boot
+  dumpCertificateDiagnostics();
+
+  // ── TLS PROBE — test conexiune reala la NGINX la boot ─────
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n── TLS PROBE — test conexiune la NGINX ─────────────");
+
+    // Test 1: Cu verificare CA (modul normal)
+    WiFiClientSecure probeClient;
+    probeClient.setCACert(current_root_ca_pem.c_str());
+    probeClient.setCertificate(current_client_cert_pem.c_str());
+    probeClient.setPrivateKey(current_client_key_pem.c_str());
+    probeClient.setTimeout(5000);
+
+    Serial.printf("[PROBE] Conectare la %s:%d cu CA verification...\n",
+                  gateway_host, gateway_port);
+    if (probeClient.connect(gateway_host, gateway_port)) {
+      Serial.println("[PROBE] ✓ TLS HANDSHAKE REUSIT cu CA verification!");
+      probeClient.stop();
+    } else {
+      Serial.println("[PROBE] ✗ TLS HANDSHAKE ESUAT cu CA verification!");
+      Serial.println("[PROBE] Eroarea este la verificarea certificatului "
+                     "SERVER al NGINX-ului.");
+
+      // Test 2: Fara verificare CA (setInsecure) — doar pt diagnostic
+      WiFiClientSecure insecureClient;
+      insecureClient.setInsecure(); // Skip server cert verification
+      insecureClient.setCertificate(current_client_cert_pem.c_str());
+      insecureClient.setPrivateKey(current_client_key_pem.c_str());
+      insecureClient.setTimeout(5000);
+
+      Serial.printf("[PROBE] Conectare la %s:%d fara CA verification "
+                    "(setInsecure)...\n",
+                    gateway_host, gateway_port);
+      if (insecureClient.connect(gateway_host, gateway_port)) {
+        Serial.println("[PROBE] ✓ TLS REUSIT cu setInsecure() — "
+                       "problema e la SERVER CERT VERIFICATION!");
+        Serial.println("[PROBE] Solutie: NGINX prezinta un cert pe care "
+                       "CA-ul nostru NU il poate verifica.");
+        Serial.println("[PROBE] Verificati ca gateway.crt in NGINX e semnat "
+                       "de acelasi NFC-Payment-CA.");
+        insecureClient.stop();
+      } else {
+        Serial.println("[PROBE] ✗ TLS ESUAT si cu setInsecure() — "
+                       "problema nu e la cert verification!");
+        Serial.println("[PROBE] Posibil: firewall, port inchis, IP gresit, "
+                       "sau versiune TLS incompatibila.");
+      }
+    }
+    Serial.println("── END TLS PROBE ───────────────────────────────────\n");
+  }
+
+  // NFC — modulul e defect; dezactivat pentru a preveni conflicte de pini cu
+  // Keypad, LED si Haptic SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI,
+  // PN532_SS); nfc.begin(); nfc.SAMConfig();
 
   // Verificare reinnoire certificat la boot
   runPkiRenewCheckIfNeeded();
@@ -1855,7 +2207,8 @@ void setup() {
   }
 
   showMessage("Gata de plata", "Asteptati...");
-  Serial.println("[POS] Gata. Asteptam tranzactie din dashboard pe POST /initiate\n");
+  Serial.println(
+      "[POS] Gata. Asteptam tranzactie din dashboard pe POST /initiate\n");
 }
 
 // ============================================================

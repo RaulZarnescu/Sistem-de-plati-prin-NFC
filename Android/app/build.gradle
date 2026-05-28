@@ -18,6 +18,11 @@ android {
         vectorDrawables {
             useSupportLibrary true
         }
+
+        // FIX #5: IP backend configurat din gradle.properties (nu hardcodat în cod)
+        // Actualizați DEFAULT_GATEWAY_IP în gradle.properties cu IP-ul laptopului.
+        buildConfigField "String", "DEFAULT_GATEWAY_IP",
+            "\"${project.findProperty('DEFAULT_GATEWAY_IP') ?: '192.168.1.100'}\""
     }
 
     buildTypes {
@@ -35,6 +40,7 @@ android {
     }
     buildFeatures {
         compose true
+        buildConfig true   // necesar pentru BuildConfig.DEFAULT_GATEWAY_IP
     }
     composeOptions {
         kotlinCompilerExtensionVersion '1.5.14'

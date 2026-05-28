@@ -84,3 +84,8 @@ certs/*.crt
 certs/*.csr
 certs/*.srl
 !certs/.gitkeep
+
+# --- ESP32 PROVISIONING -----------------------------------------
+# Sketch-ul de provisioning conține certificate (chiar și placeholder).
+# NU urca niciodată în repo public.
+ESP32/provisioning/provisioning.ino
